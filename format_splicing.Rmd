@@ -1,0 +1,231 @@
+---
+title: "Format splicing data"
+output: html_notebook
+---
+
+
+Read in data, filter 
+
+```{r quantile normalize}
+
+## load useful functions and packages
+source("../../analysis/main/eqtl_fncs.R")
+
+## read in count data
+lc.count = read.delim("leafcutter_all_perind_numers.counts.gz", stringsAsFactors=F, sep="") %>%
+  tibble::rownames_to_column(var="intron") %>%
+  separate(intron, into=c("chr","start","end","clust"), sep=":", remove=F) %>%
+  rename_at(vars(starts_with("Sample")),
+                 list(~ str_replace(., "Sample_", ""))) %>%
+  rename_at(vars(ends_with("leafcutter")),
+                 list(~ str_replace(., ".leafcutter", "")))
+
+## read in fraction data
+lc.frac  = read.delim("leafcutter_all_perind.counts.gz", stringsAsFactors=F, sep="") %>%
+  dplyr::rename(intron=chrom) %>% 
+  separate(intron, into=c("chr","start","end","clust"), sep=":", remove=F) %>%
+  rename_at(vars(starts_with("Sample")),
+                 list(~ str_replace(., "Sample_", ""))) %>%
+  rename_at(vars(ends_with("leafcutter")),
+                 list(~ str_replace(., ".leafcutter", "")))
+
+lc.frac.rank = lc.frac %>%
+  select(intron) %>%
+  separate(intron, into=c("chr","start","end","clust"), sep=":", convert=T, remove=F) %>%
+  mutate(length = end - start) %>%
+  group_by(clust) %>%
+  mutate(rank = rank(length)) %>%
+  unite("intron", chr, start, end, clust, sep=".")
+
+## info for cluster-to-gene mapping
+lc.genes = read.delim("leafcutter_all.clu2gene.txt", stringsAsFactors=F, sep="", 
+                      col.names=c("clust","chr","start","end","v19_id","mean","median","min","max")) %>%
+  filter(nchar(v19_id) > 1) %>%
+  mutate(gene_id = strip_ensembl(v19_id))
+
+gencode.pc_linc = read.delim("../../genomes/gencode.v19.genes.v7.patched_contigs.pc_linc.bed.gz",
+                             header=F, col.names=c("chr","start","end","strand","gene_id","gene_type")) %>%
+  mutate(gene_id = strip_ensembl(gene_id))
+samps = readLines("../../misc/samps.txt")
+pop_samps = read.delim("../../misc/pop_samples.in5M.txt", stringsAsFactors=F,
+                       col.names=c("sample","pop"), header=F)
+
+```
+
+
+Filter data
+
+```{r}
+
+## get cluters to keep based on pc/lincRNA genes
+lc.genes.pc_linc = lc.genes %>%
+  filter(strip_ensembl(v19_id) %in% gencode.pc_linc$gene_id)
+
+## keep introns with with no more than 5 individuals with 0 reads.
+intron_keep = lc.count %>%
+  filter(clust %in% lc.genes.pc_linc$clust) %>% # get pc/lincRNA clusters
+  gather(key="sample", value="reads", -c(intron, chr, start, end, clust)) %>%
+  group_by(intron) %>%
+  summarise(num_zero = sum(reads==0)) %>%
+  filter(num_zero <= 5) %>%
+  pull(intron)
+
+## keep clusters with at least 20 reads in 100 individuals, nonzero in at least 10 individuals, and part of a protein-coding or lincRNA gene
+clust_keep = lc.count %>%
+  filter(clust %in% lc.genes.pc_linc$clust) %>% # get pc/lincRNA clusters
+  gather(key="sample", value="reads", -c(intron, chr, start, end, clust)) %>%
+  group_by(clust, sample) %>%
+  summarise(sum_reads = sum(reads)) %>%
+  ungroup %>%
+  group_by(clust) %>%
+  summarise(num_thresh = sum(sum_reads >= 20), num_zero = sum(sum_reads==0)) %>%
+  filter(num_thresh >= 100 & num_zero < 10) %>% # filter using above criteria
+  pull(clust)
+
+
+## filter fraction data
+lc.frac.filt = lc.frac %>%
+  filter(intron %in% intron_keep & clust %in% clust_keep) %>%
+  unite(col="intron", c(chr, start, end, clust), sep=":") %>%
+  dplyr::select(c("intron", samps)) # keep only those samples with genetic data
+
+## write out filtered cluster info
+write.table(x=lc.frac.filt %>% rename(chrom=intron), # change column name back
+            file="leafcutter_all_perind.counts.filt",
+            row.names=F,
+            quote=F)
+system("bgzip -f leafcutter_all_perind.counts.filt")
+
+```
+
+
+Quantile-normalize table using leafcutter function
+
+```{r}
+
+system("python ~/bin/leafcutter/scripts/prepare_phenotype_table.py leafcutter_all_perind.counts.filt.gz -p 10")
+
+```
+
+
+Compute PEER factors
+
+```{r}
+## read in quantile-normalized data
+lc.norm = read_tsv("leafcutter_all_perind.counts.filt.qqnorm.gz")
+
+## compute 10 PEER factors
+lc.norm.peer20 = lc.norm %>%
+  select(samps) %>%
+  as.matrix %>%
+  t %>% 
+  run_peer(., num_factors=20)
+
+lc.norm.peer20.df = as.data.frame(lc.norm.peer20) %>%
+  setNames(paste0("peer", 1:20)) %>%
+  mutate(sample = samps) %>%
+  inner_join(., pop_samps, by="sample")
+
+```
+
+
+Combine PEER factors with other covars and regress quantile-normalized 
+
+```{r}
+
+## covariates include sex, age, collection date, and cell type fractions
+sex_age = read_table("covariates.sex_age", col_names=c("group","sample","foo","sex","age")) %>%
+  select(c(sample, sex, age))
+
+date = read_tsv("delivery_date.txt", col_names=c("sample","date"))
+
+ctypes = read_csv("all.secondpass.rsem.genes.noribo.LM22.cibersort.csv") %>%
+  select(-c(`P-value`, `Pearson Correlation`, RMSE)) %>%
+  rename(sample=`Input Sample`)
+names(ctypes) = make.names(names(ctypes), unique=T)
+
+## combine covariates
+covars = Reduce(function(...) merge(..., by="sample"),
+                list(sex_age, date, ctypes))
+covars = covars[match(samps, covars$sample),]
+
+## get covariates togther
+dir.create("covars")
+lc.covars_list = list()
+for (i in 1:20){
+  
+  peer=paste0("peer", i)
+  
+  lc.covars_list[[peer]] = lc.norm.peer20[,1:i] %>%
+    as.data.frame %>%
+    setNames(paste0("peer", 1:i)) %>%
+    mutate(sample=samps) %>%
+    merge(covars, ., by="sample", sort=F)
+  
+  write.table(lc.covars_list[[peer]], file.path("covars", paste(c("covars.sex.age.date.cibersort.peer",i,".txt"), collapse="")),
+              quote=F, row.names=F, sep="\t")
+}
+
+## also write covariates with 0 peer factors
+lc.covars_list[["peer0"]] = covars
+  
+write.table(covars, file.path("covars", "covars.sex.age.date.cibersort.peer0.txt"),
+            quote=F, row.names=F, sep="\t")
+
+```
+
+
+Regress against covariates
+
+```{r}
+
+## transpose matrix
+lc.norm.wide = lc.norm %>%
+  gather(key="sample", value="lc_norm", -c("#Chr", start, end, ID)) %>%
+  select(-c("#Chr", start, end)) %>%
+  spread(ID, lc_norm) %>%
+  arrange(match(sample, samps))
+
+lc.norm.mat = lc.norm.wide %>%
+  select(-sample) %>%
+  as.matrix
+
+## make directory to write out residualized phenotypes
+dir.create("pheno_resid")
+for (peer in names(lc.covars_list)){
+  
+  ## keep all of the samples straight
+  samp.temp = lc.covars_list[[peer]]$sample
+  
+  ## convert covariate file to matrix
+  covar.mat = lc.covars_list[[peer]] %>%
+    select(-c(sample,date)) %>%
+    cbind(., model.matrix(~factor(date), lc.covars_list[[peer]])) %>% ## date must be expanded as dummy variables. Also adds intercept term
+    as.matrix
+    
+  ## residualize
+  resid.mat = lc.norm.mat - covar.mat %*% solve(t(covar.mat) %*% covar.mat) %*% t(covar.mat) %*% lc.norm.mat
+  resid.df = cbind(data.frame(sample=samp.temp), as.data.frame(resid.mat)) %>%
+    setNames(names(lc.norm.wide))
+  
+  ## write out residualized data
+  gather(resid.df, key="ID", value="lc_norm", -sample) %>%
+    spread(sample, lc_norm) %>%
+    merge(lc.norm %>% select(c("#Chr",start,end,ID)), ., by="ID") %>% ## add intron position information
+    select(c("#Chr", "start", "end", "ID", samps)) %>% ## reorder columns
+    write.table(., file.path("pheno_resid", peer, paste(c("Sample_ALL.secondpass.leafcutter.covars", peer, "resid.txt"), collapse=".")),
+                sep="\t", quote=F, row.names=F)
+}
+
+```
+
+
+Get genes that correspond to each cluster:
+
+```{bash}
+
+python ~/bin/leafcutter/clustering/get_cluster_gene.py \
+/local1/derek/data/genomes/gencode.v19.transcripts.patched_contigs.gtf \
+leafcutter_all_perind.counts.filt.gz
+
+```

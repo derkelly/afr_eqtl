@@ -1,0 +1,1174 @@
+---
+title: "GEMMA sQTL"
+author: "derkelly"
+date: "7/18/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Compare number of sQTLs discovered across different PEER factors:
+
+```{r}
+
+fdr=0.05
+
+lc_cols = c("intron","snp_hg19","foo","bar","nmiss","allele1","allele0","af","beta","se","logl_H1","l_remle","l_mle","p_wald","p.value","p_score","r2","v19_id")
+
+lc_stats = data.frame()
+for (peer in paste("peer", 0:10, sep="")){
+  
+  lc.f = paste(c("round2/Sample_ALL.secondpass.leafcutter.covars.", peer, ".resid.gemma.100kb.lmm4.r2.wgene.txt.gz"), collapse="")
+  
+  
+  lc = fread(lc.f, col.names=lc_cols, na.strings=c(".","?")) %>%
+    filter(!is.na(v19_id)) %>%
+    filter(af >= 0.05 & af <= 0.95) %>% # SNPs with MAF >= 0.05
+    filter(r2 > 0.3 | is.na(r2)) %>%
+    mutate(gene_id = strip_ensembl(v19_id)) %>%
+    filter(gene_id %in% gencode.pc_linc$gene_id) %>%
+    group_by(intron) %>%
+    mutate(bhp = p.adjust(p.value, method="BH"))
+  
+  lc.min_bhp = lc %>%
+    group_by(intron) %>%
+    summarise(min_bhp = min(bhp))
+  
+  fdr_thresh = lc.min_bhp %>%
+    mutate(bhp_bhp = p.adjust(min_bhp, method="BH")) %>%
+    filter(bhp_bhp<=0.05) %>%
+    pull(min_bhp) %>%
+    max
+    
+  lc.fdr05 = lc %>%
+    filter(bhp <= fdr_thresh)
+  
+  lc_stats = rbind(
+    lc_stats,
+    data.frame(peer = peer,
+               nsqtl = dim(lc.fdr05)[1],
+               nsgenes = length(unique(lc.fdr05$gene_id)),
+               nintrons = length(unique(lc.fdr05$intron)),
+               pi1 = 1 - pi0est(lc$p.value)$pi0))
+    
+}
+
+## save results 
+write.table(lc_stats, "lc_stats.txt", quote=F, sep="\t", row.names=F)
+
+## read in results to make plot
+lc_stats = read_tsv("lc_stats.txt")
+
+## plot number of sQTLs
+lc_stats %>%
+  gather(key="stat", value="value", -peer) %>%
+  separate(peer, into=c("foo","peer"), sep="r", conver=T) %>%
+  ggplot(., aes(x=peer, y=value)) + 
+  geom_point() + 
+  theme_bw(base_size=15) + 
+  facet_wrap(~stat, scales="free_y") + 
+  scale_color_manual(values=c("black","red")) + 
+  theme(legend.position="none", axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+
+5 PEER factors maximizes the number of sQTLs. Get sQTLs
+
+```{r}
+
+lc_cols = c("intron","snp_hg19","foo","bar","nmiss","allele1","allele0","af","beta","se","logl_H1","l_remle","l_mle","p_wald","p.value","p_score","r2","v19_id")
+
+lc.f = "round2/Sample_ALL.secondpass.leafcutter.covars.peer5.resid.gemma.100kb.lmm4.r2.wgene.txt.gz"
+
+lc = fread(lc.f, col.names=lc_cols, na.strings=c(".","?")) %>%
+  select(-c(foo, bar)) %>%
+  filter(!is.na(v19_id)) %>%
+  filter(af >= 0.05 & af <= 0.95) %>% # SNPs with MAF >= 0.05
+  filter(r2 > 0.3 | is.na(r2)) %>%
+  mutate(gene_id = strip_ensembl(v19_id)) %>%
+  filter(gene_id %in% gencode.pc_linc$gene_id) %>%
+  group_by(intron) %>%
+  separate(snp_hg19, into=c("chr","pos_hg19"), sep=":", remove=F) %>%
+  mutate(bhp = p.adjust(p.value, method="BH"))
+  
+lc.min_bhp = lc %>%
+  group_by(intron) %>%
+  summarise(min_bhp = min(bhp))
+
+fdr_thresh = lc.min_bhp %>%
+  mutate(bhp_bhp = p.adjust(min_bhp, method="BH")) %>%
+  filter(bhp_bhp<=0.05) %>%
+  pull(min_bhp) %>%
+  max
+
+# lc.fdr05 = lc %>%
+#   filter(bhp <= fdr_thresh)
+# 
+# lc.fdr05.top = lc.fdr05 %>%
+#   group_by(intron) %>%
+#   filter(p.value==min(p.value)) %>%
+#   sample_n(1)
+
+lc.sgenes = lc %>%
+  mutate(fdr_sig = bhp <= fdr_thresh) %>%
+  group_by(intron) %>%
+  filter(sum(fdr_sig) > 0) %>%
+  mutate(top_ssnp = (p.value==min(p.value)),
+         maf = ifelse(af < 0.5, af, 1-af))
+
+# write out useful results
+write.table(lc.sgenes, "lc.sgenes.tsv", sep="\t", quote=F, row.names=F)
+system("bgzip -f lc.sgenes.tsv")
+                        
+# clean up
+rm(lc, lc.min_bhp, fdr_thresh)
+
+```
+
+
+Calculate useful data
+
+```{r}
+
+# add hg38 positional information
+hg19_to_hg38.s = liftover_call(unique(tabixify(lc.sgenes$chr,
+                                               lc.sgenes$pos_hg19,
+                                               lc.sgenes$pos_hg19)),
+                               "/local1/derek/data/genomes/hg19ToHg38.over.chain") %>%
+  separate(old, into=c("chr", "range"), sep=":") %>%
+  separate(range, into=c("pos_hg19", "foo"), sep="-") %>%
+  separate(new, into=c("chr", "range"), sep=":") %>%
+  separate(range, into=c("pos_hg38", "foo"), sep="-") %>%
+  select(-foo)
+
+write.table(hg19_to_hg38.s, "hg19_to_hg38.sgenes.tsv", sep="\t", quote=F, row.names=F)
+system("bgzip -f hg19_to_hg38.sgenes.tsv")
+
+# # add EUR MAF
+# lc.sgenes.eur_af.tabix = lc.sgenes %>%
+#   mutate(tabix_id = tabixify(chr, pos_hg19, pos_hg19)) %>%
+#   pull(tabix_id)
+# 
+# lc.sgenes.eur_af = tabix2df("../../misc/1kgenomes.eur_af.txt.gz",
+#                      lc.sgenes.eur_af.tabix,
+#                      c("chr","pos_hg19","onekg_ref","onekg_alt","sv_type","eur_af")) %>%
+#   mutate(eur_af = as.numeric(eur_af))
+
+```
+
+
+#### START MOST ANALYSES HERE ####
+
+Read in useful data
+
+```{r}
+
+# sQTL info
+lc.sgenes = read_tsv("lc.sgenes.tsv.gz", col_types=c("ccnnnccnnnnnnnnnnccnlln")) %>%
+  separate(snp_hg19, into=c("chr","pos_hg19"), sep=":") %>%
+  separate(intron, into=c("chr1","start_hg19","end_hg19","clust"), sep=":", convert=T) %>%
+  unite("intron", chr1, start_hg19, end_hg19, clust, sep=".", remove=F) %>%
+  mutate(v19_id1 = v19_id) %>%
+  unite("afr_intron", chr1, start_hg19, end_hg19, v19_id1, sep="_") %>%
+  mutate(sqtl_hg19 = paste(intron, pos_hg19, sep=":"))
+
+# ## info for cluster-to-gene mapping
+# 
+#                       col.names=c("clust","chr","start","end","v19_id","mean","median","min","max")) %>%
+#   filter(nchar(v19_id) > 1) %>%
+#   mutate(gene_id = strip_ensembl(v19_id))
+
+lc.sgenes.eur_af = tabix2df("../../misc/ALL.phase3_shapeit2_mvncall_integrated_v5a.20130502.genotypes.EUR.snps.af.txt.gz",
+                            unique(tabixify(lc.sgenes$chr,
+                                            lc.sgenes$pos_hg19,
+                                            lc.sgenes$pos_hg19)),
+                            c("chr","pos_hg19","ref_1kg","alt_1kg","eur_af"))
+
+# info for clust-to-gene mapping
+clust_gene = read_table2("leafcutter_all.clu2gene.txt", na="?",
+                        col_names=c("clust","chr","start_hg19","end_hg19","v19_id",paste0("foo",1:4))) %>%
+  select(clust, chr, start_hg19, end_hg19, v19_id)
+
+hg19_to_hg38.s = read_tsv("hg19_to_hg38.sgenes.tsv.gz") %>%
+  unique
+
+```
+
+
+Look at distribution of sQTLs around target intron
+
+```{r}
+
+library(cowplot)
+
+# variant distribution plotting
+lc.top.plot.df = lc.sgenes %>%
+  filter(top_ssnp) %>%
+  separate(intron, into=c("chr","intron_start","intron_end","clust"), sep=":", convert=T) %>%
+  merge(gencode.pc_linc, by="gene_id") %>%
+  mutate(five_prime_dist = ifelse(strand=="+",
+                                  pos_hg19 - intron_start,
+                                  intron_end - pos_hg19),
+         three_prime_dist = ifelse(strand=="+",
+                                   pos_hg19 - intron_end,
+                                   intron_start - pos_hg19))
+
+lc.top.upstream.hist = lc.top.plot.df %>%
+  filter(five_prime_dist < 0) %>%
+  ggplot(., aes(x=five_prime_dist/1000)) +
+  geom_histogram(bins=20, alpha=0.6) + 
+  theme_classic(base_size=15) + 
+  theme(axis.line.y=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  xlab("5' distance (kb)")
+
+lc.top.intron.hist = lc.top.plot.df %>%
+  filter(five_prime_dist >= 0 & three_prime_dist <= 0) %>%
+  mutate(intron_dist = five_prime_dist / (five_prime_dist - three_prime_dist)) %>%
+  ggplot(., aes(x=intron_dist)) +
+  geom_histogram(breaks = 0:10/10, alpha=0.6) +
+  theme_classic(base_size=15) + 
+  theme(axis.line.y=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+lc.top.downstream.hist = lc.top.plot.df %>%
+  filter(three_prime_dist > 0) %>%
+  ggplot(., aes(x=three_prime_dist/1000)) +
+  geom_histogram(bins=20, alpha=0.6) + 
+  theme_classic(base_size=15) + 
+  theme(axis.line.y=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) + 
+  xlab("3' distance (kb)")
+
+plot_grid(lc.top.upstream.hist, lc.top.intron.hist, lc.top.downstream.hist, nrow=1)
+
+```
+
+
+Compare to GTEx
+
+```{r}
+
+# map between intron coordinates in hg19 and hg38, preserving the gene_id
+# liftover hg19 intron coordinates
+clust_gene.hg38 = liftover_call(unique(tabixify(addchr(clust_gene$chr),
+                                                clust_gene$start_hg19,
+                                                clust_gene$end_hg19)),
+                                "/local1/derek/data/genomes/hg19ToHg38.over.chain") %>%
+  # split tabixified data into chr, start, and end for introns
+  separate(new, into=c("chr", "range"), sep=":") %>%
+  separate(range, into=c("start_hg38", "end_hg38"), sep="-", convert=T) %>%
+  group_by(old) %>%
+  # remove gaps
+  summarise(chr = unique(chr),
+            start_hg38 = min(start_hg38),
+            end_hg38 = max(end_hg38)) %>%
+  separate(old, into=c("chr", "range"), sep=":") %>%
+  separate(range, into=c("start_hg19", "end_hg19"), sep="-", convert=T) %>%
+  mutate(chr = rmchr(chr)) %>%
+  # add gene info
+  merge(clust_gene) %>%
+  # add v26 and gene_id
+  merge(gene_map %>%
+          filter(!is.na(v19_id)),
+        all.x=T)
+
+intron_map = clust_gene.hg38 %>%
+  unite("intron", chr, start_hg19, end_hg19, clust, sep=".", remove=F) %>%
+  unite("afr_intron", chr, start_hg19, end_hg19, v19_id, sep="_", remove=F) %>%
+  mutate(chr1 = addchr(chr)) %>%
+  unite("gtexv8_intron", chr1, start_hg38, end_hg38, v26_id, sep="_", remove=F) %>%
+  select(intron, afr_intron, gtexv8_intron) %>%
+  unique
+
+write.table(intron_map, "intron_map.tsv", quote=F, sep="\t", row.names=F)
+  
+
+# afr_gtexv8_clust = read.delim("../../misc/afr_sqtl_clusters.hg38.bed", header=F,
+#                               col.names=c("chr_hg38","start_hg38","end_hg38","clust_id")) %>%
+#   separate(clust_id, into=c("chr_hg19","start_hg19","end_hg19","v19_id"), sep=":") %>%
+#   merge(gene_map) %>%
+#   unite("gtexv8_intron", chr_hg38, start_hg38, end_hg38, v29_id, sep="_") %>%
+#   unite("afr_intron", chr_hg19, start_hg19, end_hg19, v19_id, sep="_")
+
+
+# gtexv8_sqtl_cols = c("gtexv8_id","chr","pos","gtexv8_clust","gtexv8_snp","tss_dist","ma_samples","ma_count","maf","pval_nominal","slope","slope_se")
+
+# to extract GTEx v8 intron info, I need:
+# 1. the mapped introns (hg19 -> hg38)
+# 2. the mapped SNPs
+# first, map the SNPs
+lc.sgenes.v8.tabix = hg19_to_hg38.s %>%
+  # add intron and gene information to SNP information
+  merge(lc.sgenes %>% select(intron, v19_id, chr, pos_hg19, allele0, allele1, fdr_sig, top_ssnp)) %>%
+  # add hg38 intron information
+  merge(intron_map) %>%
+  unique %>%
+  # filter(!(is.na(pos_hg38) | is.na(v26_id))) %>%
+  mutate(tabix_id = tabixify(gtexv8_intron, pos_hg38, pos_hg38)) %>%
+  pull(tabix_id)
+
+
+# now, extract GTEx v8 SNPs
+gtex.v8.sqtl.f = "../../gtex/v8/GTEx_Analysis_v8_sQTL_all_associations_Whole_Blood.v8.sqtl_allpairs.sort.txt.gz"
+gtex.v8.sqtl.cols = c("gtexv8_intron","chr","pos_hg38","gtexv8_clust","gtexv8_snp","tss_dist","ma_samples","ma_count","gtexv8_maf","gtexv8_pval","gtexv8_slope","gtexv8_se")
+
+lc.sgenes.gtex = tabix2df(gtex.v8.sqtl.f,
+                          lc.sgenes.v8.tabix,
+                          gtex.v8.sqtl.cols) %>%
+  separate(gtexv8_snp, into=c("chr","pos_hg38","v8_ref","v8_alt","bar"), sep="_") %>%
+  mutate(chr = rmchr(chr))
+
+write.table(lc.sgenes.gtex, "lc.sgenes.gtex.tsv", sep="\t", quote=F, row.names=F)
+system("bgzip -f lc.sgenes.gtex.tsv")
+
+lc.sgenes.gtex = read_tsv("lc.sgenes.gtex.tsv.gz")
+
+
+# calculate pi0
+lc.sgenes.gtex.pi0 = lc.sgenes %>%
+  filter(fdr_sig) %>%
+  select(intron, chr, pos_hg19) %>%
+  merge(hg19_to_hg38.s) %>%
+  merge(intron_map) %>%
+  merge(lc.sgenes.gtex) %>%
+  pull(gtexv8_pval) %>%
+  pi0est
+
+
+# compare effect sizes
+lc.sgenes.gtex.betas = lc.sgenes.v8.tabix %>%
+  filter(top_ssnp) %>%
+  unite("intron", chr, start_hg19, end_hg19, clust, sep=".") %>%
+  select(gtexv8_intron, pos_hg38, intron, pos_hg19) %>%
+  merge(lc.sgenes.gtex %>%
+          select(gtexv8_intron, pos_hg38, gtexv8_slope, gtexv8_pval, v8_ref, v8_alt)) %>%
+  merge(lc.sgenes %>%
+          filter(top_ssnp) %>%
+          select(intron, pos_hg19, allele0, allele1, p.value, beta)) %>%
+  unique %>%
+  filter((allele1==v8_ref & allele0==v8_alt) |
+           (allele0==v8_ref & allele1==v8_alt)) %>%
+  mutate(gtexv8_slope = ifelse(allele1==v8_ref & allele0==v8_alt, gtexv8_slope, -gtexv8_slope))
+
+lc.sgenes.v8.tabix %>%
+  filter(top_ssnp) %>%
+  unite("intron", chr, start_hg19, end_hg19, clust, sep=".") %>%
+  select(gtexv8_intron, pos_hg38, intron, pos_hg19) %>%
+  merge(lc.sgenes.gtex %>%
+          select(gtexv8_intron, pos_hg38, gtexv8_slope, v8_ref, v8_alt)) %>%
+  merge(lc.sgenes %>%
+          filter(top_ssnp) %>%
+          select(intron, pos_hg19, allele0, allele1, beta)) %>%
+  unique %>%
+  filter((allele1==v8_ref & allele0==v8_alt) |
+           (allele0==v8_ref & allele1==v8_alt)) %>%
+  mutate(gtexv8_slope = ifelse(allele1==v8_ref & allele0==v8_alt, gtexv8_slope, -gtexv8_slope)) %>%
+  ggplot(aes(x=beta, y=gtexv8_slope)) +
+  geom_point(alpha=0.2) +
+  theme_classic(base_size=15) +
+  ggtitle("Effect sizes of sQTLs")
+
+
+# compare MAF in GTEx for replicate and fail to replicate
+lc.sgenes.gtex %>%
+  filter(top_ssnp &
+           ((v8_ref==allele0 & v8_alt==allele1) |
+              v8_ref==allele1 & v8_alt==allele0)) %>%
+  group_by(gene_id) %>%
+  sample_n(1) %>%
+  ggplot(aes(x=gtexv8_maf, color=gtexv8_pval<0.01)) +
+  stat_ecdf(size=2) +
+  theme_classic(base_size=15)
+
+
+
+```
+
+
+Find sQTLs that aren't tested in GTEx but are in 1000G
+
+```{r}
+
+bar = lc.sgenes %>%
+  # get only the tag SNPs *not* tested in GTEx v8
+  filter(top_ssnp) %>%
+  # add hg38 info, removing SNPs that don't map
+  merge(hg19_to_hg38.s) %>%
+  mutate(snp_hg38 = paste(chr, pos_hg38, sep=":")) %>%
+  # get only those SNPs not tested in GTEx v8
+  filter(!(snp_hg38 %in% gtexv8_snps)) %>%
+  select(gene_id, pos_hg19, pos_hg38, maf) %>%
+  # add 1KG EUR AF
+  merge(lc.sgenes.eur_af)
+
+```
+
+
+Perform GSEA enrichment for genes that show large effect-size differences
+
+```{r}
+
+# plot effect sizes, coloring by whether the african allele is independent
+set.seed(42)
+
+lc.beta_diffs = lc.sgenes %>%
+  select(intron, gene_id, chr, pos_hg19, sqtl_hg19, allele0, allele1, p.value, beta) %>%
+  # add hg38 info
+  merge(hg19_to_hg38.s) %>%
+  # add intron info %>%
+  merge(intron_map) %>%
+  # merge with GTEx v8
+  merge(gtex.v8.sgenes.range) %>%
+  # flip alleles
+  filter((allele1 == v8_ref & allele0 == v8_alt) |
+           (allele0 == v8_ref & allele1 == v8_alt)) %>%
+  mutate(gtexv8_slope = ifelse(allele1 == v8_ref &
+                                 allele0 == v8_alt,
+                               gtexv8_slope,
+                               1 - gtexv8_slope)) %>%
+  # get the top SNP per gene that is also tested in GTEx
+  group_by(gene_id) %>%
+  filter(p.value==min(p.value)) %>%
+  sample_n(1) %>%
+  arrange(-beta) %>%
+  pull(gene_id)
+
+lc.beta_diffs.gsea = gost(query = lc.beta_diffs,
+                          organism = "hsapiens",
+                          ordered_query = T)
+
+```
+
+
+Find independent sQTLs by regress intron inclusion on independent sQTLs from
+GTEx v8
+
+```{r}
+
+# get quantile-normalized and residualized values, add gene information
+lc_norm = read_tsv("pheno_resid/peer5/Sample_ALL.secondpass.leafcutter.covars.peer5.resid.txt.gz") %>%
+  dplyr::rename(chr = `#Chr`,
+                intron = ID)# %>%
+  # add v19_id
+  merge(lc.genes %>% select(chr, start, end, v19_id)) #%>%
+  # # create afr_intron
+  # unite("afr_intron", chr, start, end, v19_id, sep="_", remove=F)
+
+
+# read in independent associations
+gtex.v8.indep.s = read_tsv("../../gtex/v8/GTEx_Analysis_v8_sQTL_independent/Whole_Blood.v8.independent_sqtls.txt.gz") %>%
+  separate(phenotype_id, into=c("chr","intron_start","intron_end","clust","v26_id"), sep=":", convert=T) %>%
+  mutate(gene_id = strip_ensembl(v26_id)) %>%
+  unite("gtexv8_intron", chr, intron_start, intron_end, v26_id, sep="_") %>%
+  separate(variant_id, into=c("chr","pos_hg38","gtexv8_ref","gtexv8_alt","foo"), sep="_", convert=T) %>%
+  mutate(chr = rmchr(chr),
+         gtexv8_sqtl = paste(gtexv8_intron, pos_hg38, sep=":")) #%>%
+    # restrict to variants tested in Africans
+  filter(gtexv8_sqtl %in% paste(lc.sgenes.gtex$gtexv8_intron, lc.sgenes.gtex$pos_hg38, sep=":")) %>%
+  # restrict to SNPs
+  filter(nchar(gtexv8_ref)==1 & nchar(gtexv8_alt)==1) %>%
+  select(-foo)
+
+# because not every intron tested in GTEx has an sQTL, I'm also going to regress
+# out the effect of the top GTEx sQTL for each gene
+gtex.v8.top_in_afr.s = lc.sgenes.gtex %>%
+  separate(gtexv8_intron, into=c("chr","intron_start","intron_end","v26_id"), sep="_", remove=F) %>%
+  mutate(gene_id = strip_ensembl(v26_id)) %>%
+  group_by(gtexv8_intron) %>%
+  filter(gtexv8_pval == min(gtexv8_pval)) %>%
+  sample_n(1) %>%
+  ungroup %>%
+  mutate(chr = rmchr(chr))
+
+# because some GTEx SNPs are tested in Africans and vice versa, I am going to
+# append the top GTEx SNPs
+gtex.v8.indep_top.s = rbind(gtex.v8.indep.s %>% select(gtexv8_intron, chr, pos_hg38),
+                            gtex.v8.top_in_afr.s %>% select(gtexv8_intron, chr, pos_hg38)) %>%
+  unique
+
+# add hg19 info
+gtex.v8.indep.regress.s = liftover_snp(addchr(gtex.v8.indep_top.s$chr),
+                                       gtex.v8.indep_top.s$pos_hg38,
+                                       "/local1/derek/data/genomes/hg38ToHg19.over.chain") %>%
+  rename(pos_hg19 = pos_new,
+         pos_hg38 = pos_old) %>%
+  mutate(chr = rmchr(chr)) %>%
+  unique %>% 
+  merge(gtex.v8.indep_top.s) %>%
+  filter(gtexv8_intron %in% lc.sgenes.gtex$gtexv8_intron) %>%
+  merge(clust_gene.hg38 %>%
+          unite("intron", chr, start_hg19, end_hg19, clust, sep=":", remove=F) %>%
+          unite("gtexv8_intron", chr, start_hg38, end_hg38, v26_id, sep="_", remove=F) %>%
+          mutate(gtexv8_intron = addchr(gtexv8_intron)) %>%
+          select(intron, gtexv8_intron, chr, start_hg19, end_hg19, clust, v19_id)) %>%
+  unique
+
+
+
+geno_cols = readLines("../../misc/geno_cols.txt")
+regress_spl = data.frame()
+for (i in unique(gtex.v8.indep.regress.s$intron)){
+  
+  # print(i)
+
+  regress_snps = gtex.v8.indep.regress.s %>%
+    filter(intron==i)
+  
+  dose = tabix2df("../../geno/5M.imputed.rna_samps.biallelic.vcf.gz",
+                  tabixify(regress_snps$chr,
+                           regress_snps$pos_hg19,
+                           regress_snps$pos_hg19),
+                  geno_cols) %>%
+    select(-c(1,2,6:9)) %>%
+    gather(key=sample, value=genotype, -c(ID, REF,ALT)) %>%
+    separate(genotype, into=c("geno","dose"), sep=":", convert=T) %>%
+    pivot_wider(names_from = ID, values_from = dose, c(ID, sample, dose))
+  
+  # if (nrow(dose) > 0){
+
+    intron_info = lc_norm %>%
+      filter(intron==i)
+    
+    spl = intron_info %>%
+      select(-c(chr, start, end, intron)) %>%
+      gather(key=sample, value=spl)
+    
+    dose_spl = merge(dose, spl)
+    
+    resids = lm(spl ~ ., data=dose_spl %>% select(-sample))$residuals
+    
+    resids.df = data.frame(sample = dose_spl$sample,
+                           resid = resids)
+    
+    out.df = pivot_wider(resids.df, names_from=sample, values_from=resid) %>%
+      cbind(intron_info[,c("chr","start","end","intron")], .)
+    
+    regress_spl = rbind(regress_spl, out.df[,colnames(intron_info)])
+  # }  
+}
+
+# add strand info for use with GEMMA scripts
+regress_spl = cbind(regress_spl[1:3],
+                    data.frame(strand="+"),
+                    regress_spl[4:ncol(regress_spl)])
+
+write.table(regress_spl, "Sample_ALL.secondpass.leafcutter.covars.peer5.resid.indep_v8_resid.txt",
+            row.names=F, col.names=F, sep="\t", quote=F)
+
+```
+
+
+Identify sQTLs that are significant after regressing on GTEx SNPs
+
+```{r}
+
+lc_cols = c("snp_hg19","intron","foo","bar","nmiss","allele1","allele0","af","beta","se","logl_H1","l_remle","l_mle","p_wald","p.value","p_score","r2")
+
+lc.f = "conditional_map/Sample_ALL.secondpass.leafcutter.covars.peer5.resid.indep_v8_resid.txt.gemma.100kb.r2.lmm4.gz"
+
+lc = fread(lc.f, col.names=lc_cols, na.strings=c(".","?")) %>%
+  select(-c(foo, bar)) %>%
+  filter(af >= 0.05 & af <= 0.95) %>% # SNPs with MAF >= 0.05
+  filter(r2 > 0.3 | is.na(r2)) %>%
+  group_by(intron) %>%
+  separate(snp_hg19, into=c("chr","pos_hg19"), sep=":", remove=F) %>%
+  mutate(bhp = p.adjust(p.value, method="BH"))
+  
+# threshold for calling significant SNPs
+bhp_thresh = lc.sgenes %>%
+  # FDR significant SNPs
+  filter(fdr_sig) %>%
+  # get the maximum BH' p-value
+  pull(bhp) %>% max
+
+# get those eQTLs that remain FDR-significant after controlling for the top GTEx v8 variant
+lc.cond_sig = lc %>%
+  filter(bhp <= bhp_thresh) %>%
+  group_by(intron) %>%
+  mutate(top_ssnp = p.value==min(p.value))
+
+write.table(lc.cond_sig, "lc.cond_sig.tsv", sep="\t", quote=F, row.names=F)
+system("bgzip -f lc.cond_sig.tsv")
+
+```
+
+
+Compare frequency, p-value, and effect size at top SNPs, coloring by whether they are independent
+
+```{r}
+
+lc.fdr05.top = lc.sgenes %>%
+  filter(top_ssnp)
+
+# Is there a frequency difference
+lc.fdr05.top %>%
+  group_by(intron) %>%
+  sample_n(1) %>%
+  mutate(sqtl_hg19 = paste(intron, pos_hg19, sep=":")) %>%
+  merge(lc.sgenes.eur_af) %>%
+  filter(((allele0 == alt_1kg) & (allele1 == ref_1kg)) |
+           ((allele1 == alt_1kg) & (allele0 == ref_1kg))) %>%
+  mutate(eur_af = ifelse(allele0 == ref_1kg, 1-eur_af, eur_af),
+         indep = sqtl_hg19 %in% paste(lc.cond_sig$intron, lc.cond_sig$pos_hg19, sep=":")) %>%
+  ggplot(aes(x=af, y=eur_af, color=indep)) +
+  geom_point(alpha=0.5) +
+  theme_classic(base_size=15)
+
+lc.fdr05.top %>%
+  group_by(intron) %>%
+  sample_n(1) %>%
+  mutate(sqtl_hg19 = paste(intron, pos_hg19, sep=":")) %>%
+  merge(lc.sgenes.eur_af) %>%
+  filter(((allele0 == alt_1kg) & (allele1 == ref_1kg)) |
+           ((allele1 == alt_1kg) & (allele0 == ref_1kg))) %>%
+  mutate(eur_af = ifelse(allele0 == ref_1kg, 1-eur_af, eur_af),
+         indep = sqtl_hg19 %in% paste(lc.cond_sig$intron, lc.cond_sig$pos_hg19, sep=":")) %>%
+  ggplot(aes(x=abs(af - eur_af), color=indep)) +
+  stat_ecdf() +
+  theme_classic(base_size=15)
+
+# ECDF of -log10(p-value)
+lc.fdr05.top %>%
+  group_by(intron) %>%
+  sample_n(1) %>%
+  mutate(sqtl_hg19 = paste(intron, pos_hg19, sep=":")) %>%
+  merge(lc.sgenes.eur_af) %>%
+  filter(((allele0 == alt_1kg) & (allele1 == ref_1kg)) |
+           ((allele1 == alt_1kg) & (allele0 == ref_1kg))) %>%
+  mutate(eur_af = ifelse(allele0 == ref_1kg, 1-eur_af, eur_af),
+         indep = sqtl_hg19 %in% paste(lc.cond_sig$intron, lc.cond_sig$pos_hg19, sep=":"),
+         log_p = -log10(p.value)) %>%
+  ggplot(aes(x=log_p, color=indep)) +
+  stat_ecdf() +
+  theme_classic(base_size=15)
+
+# effect size differences
+lc.sgenes.gtex %>%
+  select(gtexv8_intron, pos_hg38, v8_ref, v8_alt, gtexv8_slope) %>%
+  merge(lc.sgenes.v8.tabix %>%
+          unite("intron", chr, start_hg19, end_hg19, clust, sep=":") %>%
+          select(gtexv8_intron, pos_hg38, intron, pos_hg19)) %>%
+  merge(lc.fdr05.top) %>%
+  group_by(intron) %>%
+  sample_n(1) %>%
+  filter(((allele0 == v8_alt) & (allele1 == v8_ref)) |
+           ((allele1 == v8_alt) & (allele0 == v8_ref))) %>%
+  mutate(sqtl_hg19 = paste(intron, pos_hg19, sep=":"),
+         gtexv8_slope = ifelse(allele0 == v8_ref, 1-gtexv8_slope, gtexv8_slope),
+         indep = sqtl_hg19 %in% paste(lc.cond_sig$intron, lc.cond_sig$pos_hg19, sep=":")) %>%
+  ggplot(aes(x=beta, y=gtexv8_slope, color=indep)) +
+  geom_point(alpha=0.5) +
+  theme_classic(base_size=15)
+
+lc.sgenes.gtex %>%
+  select(gtexv8_intron, pos_hg38, v8_ref, v8_alt, gtexv8_slope) %>%
+  merge(lc.sgenes.v8.tabix %>%
+          unite("intron", chr, start_hg19, end_hg19, clust, sep=":") %>%
+          select(gtexv8_intron, pos_hg38, intron, pos_hg19)) %>%
+  merge(lc.fdr05.top) %>%
+  group_by(intron) %>%
+  sample_n(1) %>%
+  filter(((allele0 == v8_alt) & (allele1 == v8_ref)) |
+           ((allele1 == v8_alt) & (allele0 == v8_ref))) %>%
+  mutate(sqtl_hg19 = paste(intron, pos_hg19, sep=":"),
+         gtexv8_slope = ifelse(allele0 == v8_ref, 1-gtexv8_slope, gtexv8_slope),
+         indep = sqtl_hg19 %in% paste(lc.cond_sig$intron, lc.cond_sig$pos_hg19, sep=":")) %>%
+  ggplot(aes(x=abs(beta - gtexv8_slope), color=indep)) +
+  stat_ecdf() +
+  theme_classic(base_size=15)
+
+lc.sgenes.gtex %>%
+  select(gtexv8_intron, pos_hg38, v8_ref, v8_alt, gtexv8_slope) %>%
+  merge(lc.sgenes.v8.tabix %>%
+          unite("intron", chr, start_hg19, end_hg19, clust, sep=":") %>%
+          select(gtexv8_intron, pos_hg38, intron, pos_hg19)) %>%
+  merge(lc.fdr05.top) %>%
+  group_by(intron) %>%
+  sample_n(1) %>%
+  filter(((allele0 == v8_alt) & (allele1 == v8_ref)) |
+           ((allele1 == v8_alt) & (allele0 == v8_ref))) %>%
+  mutate(sqtl_hg19 = paste(intron, pos_hg19, sep=":"),
+         gtexv8_slope = ifelse(allele0 == v8_ref, 1-gtexv8_slope, gtexv8_slope),
+         indep = sqtl_hg19 %in% paste(lc.cond_sig$intron, lc.cond_sig$pos_hg19, sep=":")) %>%
+  ggplot(aes(x=indep, y=abs(beta - gtexv8_slope), fill=indep)) +
+  geom_violin() +
+  theme_classic(base_size=15)
+
+# tss_dist differences (proxy for LD?)
+gemma.fdr05.top %>%
+  group_by(gene_id) %>%
+  sample_n(1) %>%
+  merge(gencode.v19.tss %>% select(-chr)) %>%
+  mutate(tss_dist = pos_hg19 - tss,
+         eqtl_hg19 = paste(gene_id, pos_hg19, sep=":"),
+         indep = eqtl_hg19 %in% paste(gemma.cond_sig$gene_id, gemma.cond_sig$pos_hg19, sep=":")) %>%
+  ggplot(aes(x=tss_dist, color=indep)) +
+  stat_ecdf() +
+  theme_classic()
+
+
+```
+
+
+Read in significant sQTLs from GTEx v8
+
+```{r}
+
+gtex.v8.s.sig = read_tsv("../../gtex/v8/GTEx_Analysis_v8_sQTL/Whole_Blood.v8.sqtl_signifpairs.txt.gz") %>%
+  separate(phenotype_id, into=c("chr","start","end","clu","v26_id"), sep=":") %>%
+  unite("gtexv8_intron", chr, start, end, v26_id, sep="_")
+
+```
+
+
+Why aren't sQTLs in GTEx?
+1. The SNP does not liftover
+2. The intron does not liftover to v26
+2. The SNP is at low frequency (EUR)
+3. The SNP isn't tested in GTEx v8
+4. The intron isn't tested in GTEx v8
+
+```{r}
+
+gencode26.introns = read_tsv("../../misc/gencode.v26.GRCh38.introns.bed",
+                             col_names=c("chr","start","end","v26_id")) %>%
+  mutate(v26_start = paste(v26_id, start, sep=":"),
+         v26_end = paste(v26_id, end, sep=":"))
+
+lc.sgenes.tested = lc.sgenes %>%
+  filter(fdr_sig) %>%
+  select(intron, chr, pos_hg19, v19_id) %>%
+  separate(intron, into=c("clu","clust","na","start","end"), sep="_") %>%
+  select(-c(clu, clust, na)) %>%
+  unite("afr_intron", chr, start, end, v19_id, sep="_", remove=F) %>%
+  merge(hg19_to_hg38.s, all.x=T) %>%
+  merge(afr_gtexv8_clust, all.x=T) %>%
+  separate(gtexv8_intron, into=c("chr","start","end","v26_id"), sep="_", remove=F) %>%
+  mutate(v26_start = paste(v26_id, start, sep=":"),
+         v26_end = paste(v26_id, end, sep=":")) %>%
+  mutate(intron_lifts_over = (v26_start %in% gencode26.introns$v26_start) &
+           (v26_end %in% gencode26.introns$v26_end),
+         intron_tested_v8 = gtexv8_intron %in% lc.sgenes.gtex$gtexv8_intron,
+         snp_lifts_over = !is.na(pos_hg38),
+         snp_tested_v8 = (chr %in% lc.sgenes.gtex$chr) & (pos_hg38 %in% lc.sgenes.gtex$pos_hg38))
+
+lc.sgenes.tested.list = list(intron_lifts_over = which(lc.sgenes.tested$intron_lifts_over),
+     intron_tested_v8 = which(lc.sgenes.tested$intron_tested_v8),
+     snp_lifts_over = which(lc.sgenes.tested$snp_lifts_over),
+     snp_tested_v8 = which(lc.sgenes.tested$snp_tested_v8))
+  
+upset(fromList(lc.sgenes.tested.list), order.by = "freq")
+
+```
+
+
+Do eQTLs that aren't tested in GTEx show worse imputation?
+
+```{r}
+
+lc.sgenes.v8.tabix %>%
+  filter(fdr_sig) %>% 
+  select(afr_intron, pos_hg19, ) %>%
+  merge(lc.sgenes.tested %>%
+  select(afr_intron, pos_hg19, snp_tested_v8)) %>%
+  merge(lc.sgenes %>%
+          filter(fdr_sig) %>%
+          separate(intron, into=c("foo","bar","na","intron_start","intron_end"), sep="_") %>%
+          unite("afr_intron", chr, intron_start, intron_end, v19_id, sep="_") %>%
+          select(afr_intron, pos_hg19, p.value, maf, r2)) %>%
+  mutate(`-log10(p-value)` = -log10(p.value)) %>%
+  gather(key=variable, value=stat, c(`-log10(p-value)`, maf, r2)) %>%
+  ggplot(aes(x=stat, color=snp_tested_v8)) +
+  stat_ecdf() +
+  scale_color_ptol() +
+  theme_classic(base_size=15) +
+  facet_grid(. ~ variable, scales="free_x")
+  
+
+```
+
+
+Colocalize with GTEx
+
+```{r}
+
+# colocalize
+lc.sgenes.gtex.merge = lc.sgenes.v8.tabix %>%
+  select(gtexv8_intron, pos_hg38, intron, pos_hg19) %>%
+  merge(lc.sgenes.gtex %>%
+          select(gtexv8_intron, pos_hg38, v8_ref, v8_alt, gtexv8_maf, gtexv8_pval)) %>%
+  merge(lc.sgenes %>%
+          select(intron, pos_hg19, allele0, allele1, maf, p.value)) %>%
+  filter((v8_ref==allele0 & v8_alt==allele1) |
+           (v8_ref==allele1 & v8_alt==allele0)) %>%
+  unique
+
+# lc.sgenes.gtex.phenos = lc.sgenes.gtex.merge %>%
+#   filter(!is.na(gtexv8_pval)) %>%
+#   pull(intron) %>%
+#   unique
+
+lc_gtexv8_h4 = lapply(unique(lc.sgenes.gtex.merge$intron), function(x){
+    df.tmp = lc.sgenes.gtex.merge %>%
+      filter(intron == x) %>%
+      arrange(pos_hg19)
+    coloc.abf(dataset1=list(snp=df.tmp$pos_hg19, pvalues=df.tmp$p.value, type="quant", N=162, MAF=df.tmp$maf),
+              dataset2=list(snp=df.tmp$pos_hg19, pvalues=df.tmp$gtexv8_pval, type="quant", N=670, MAF=df.tmp$gtexv8_maf))$summary
+    })
+
+lc_gtexv8_h4.df = data.frame(intron = unique(lc.sgenes.gtex.merge$intron),
+                             H0 = sapply(lc_gtexv8_h4, function(x) x[2]),
+                             H1 = sapply(lc_gtexv8_h4, function(x) x[3]),
+                             H2 = sapply(lc_gtexv8_h4, function(x) x[4]),
+                             H3 = sapply(lc_gtexv8_h4, function(x) x[5]),
+                             H4 = sapply(lc_gtexv8_h4, function(x) x[6])) %>%
+  merge(lc.sgenes %>% select(intron, gene_id) %>% unique)
+
+lc_gtexv8_h4.df.max = lc_gtexv8_h4.df %>%
+  gather(key="hypothesis", value="probability", -c(intron, gene_id)) %>%
+  group_by(intron) %>%
+  filter(probability==max(probability))
+
+# plot
+gemma_gtexv8_h4.df.max %>%
+  mutate(intron=NA,
+         class="eQTL") %>%
+  rbind(lc_gtexv8_h4.df.max %>%
+          mutate(class="sQTL")) %>%
+  group_by(class, hypothesis) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(x=class, y=n, fill=hypothesis)) +
+  geom_bar(position="stack", stat="identity") +
+  theme_classic(base_size=15) +
+  scale_color_ptol() +
+  ggtitle("Colocalization with GTEx v8")
+  
+
+               
+               ggplot(data, aes(fill=condition, y=value, x=specie)) + 
+    geom_bar(position="fill", stat="identity")
+```
+
+
+Credible Sets
+
+```{r}
+# get all variants tested in gtexv8 ####
+gtex.v8.sgenes.range.tabix = lc.sgenes.gtex %>%
+  select(gtexv8_intron) %>%
+  unique %>%
+  separate(gtexv8_intron, into=c("chr","start","end","v26_id"), sep="_", remove=F, convert=T) %>%
+  mutate(start = start - 100000,
+         end = end + 100000) %>%
+  mutate(start = ifelse(start<0, 0, start)) %>%
+  mutate(tabix_id = tabixify(gtexv8_intron, start, end)) %>%
+  pull(tabix_id)
+  # mutate(start = as.character(start),
+  #        end = as.character(end))
+
+gtex.v8.sgenes.range = tabix2df(gtex.v8.sqtl.f,
+                                gtex.v8.sgenes.range.tabix,
+                                gtex.v8.sqtl.cols) %>%
+  separate(gtexv8_snp, into=c("chr", "pos_hg38", "v8_ref", "v8_alt", "foo")) %>%
+  select(-foo) %>%
+  mutate(sqtl_hg38 = paste(gtexv8_intron, pos_hg38, sep=":")) %>%
+  mutate(gtexv8_pval = ifelse(gtexv8_pval==0, 9.22190e-308, gtexv8_pval))
+
+write.table(gtex.v8.sgenes.range, "gtex.v8.sgenes.range.tsv", sep="\t", quote=F, row.names=F)
+system("bgzip -f gtex.v8.sgenes.range.tsv")
+
+
+gtex.v8.sgenes.range = read_tsv("gtex.v8.sgenes.range.tsv.gz")
+
+# get credible sets ####
+afr_cred_set.introns.all = lapply(unique(lc.sgenes$intron),
+                                  function(x){
+                                    df.tmp = lc.sgenes %>%
+                                      filter(intron==x)
+                                    get_cred_set.b(df.tmp$sqtl_hg19,
+                                                   df.tmp$beta,
+                                                   df.tmp$se^2, 0.9)})
+names(afr_cred_set.introns.all) = unique(lc.sgenes$intron)
+
+
+
+gtex.xv8.cred_set.introns.all = lapply(unique(gtex.v8.sgenes.range$gtexv8_intron),
+                                       function(x){
+                                         df.tmp = gtex.v8.sgenes.range %>%
+                                           filter(gtexv8_intron==x)
+                                         get_cred_set.b(df.tmp$sqtl_hg38,
+                                                        df.tmp$gtexv8_slope,
+                                                        df.tmp$gtexv8_se^2, 0.9)})
+names(gtex.xv8.cred_set.introns.all) = unique(gtex.v8.sgenes.range$gtexv8_intron)
+
+
+# compare credible sets ####
+mapped_introns = intron_map %>%
+  filter(gtexv8_intron %in% gtex.v8.sgenes.range$gtexv8_intron)
+
+
+# combine credible set info from Africans and GTEx
+lc.v8.cred_set = data.frame(cred_set = unlist(afr_cred_set.introns.all)) %>%
+  # separate into intron and position columns
+  separate(cred_set, into=c("intron", "pos_hg19"), sep=":", convert=T) %>%
+  # add hg38 position information, including only those SNPs that map between hg19 and hg38
+  merge(hg19_to_hg38.s, all.x=T) %>%
+  # add GTEx v8 introns
+  merge(mapped_introns) %>%
+  # specify that this is in the African credible set
+  mutate(afr=T) %>%
+  # add GTEx credible set info
+  merge(data.frame(cred_set = unlist(gtex.xv8.cred_set.introns.all)) %>%
+          # separate as above
+          separate(cred_set, into=c("gtexv8_intron", "pos_hg38"), sep=":", convert=T) %>%
+          # specify these are in the GTEx v8 credible set
+          mutate(v8=T),
+        # eQTLs (gene_id-pos_hg38 pairs) that overlap will merge, those that don't will not
+        all=T) %>%
+  unique
+
+
+# # now to compare credible set sizes between Africans and GTEx v8
+# # color by the SNP threshold until credible sets overlap
+# gemma.v8.s.cred_set %>%
+#   group_by(intron) %>%
+#   summarise(afr_cred_set = sum(afr, na.rm=T),
+#             v8_cred_set = sum(v8, na.rm=T)) %>%
+#   merge(gemma.v8.s.cred_set %>%
+#           filter(afr & v8) %>%
+#           group_by(intron) %>%
+#           summarise(min_afr = min(afr_rank),
+#                  min_v8 = min(v8_rank),
+#                  thresh = max(min_afr, min_v8)) %>%
+#           select(intron, thresh),
+#         all.x=T) %>%
+#   ggplot(aes(x=log10(afr_cred_set),
+#              y=log10(v8_cred_set),
+#              color=log10(thresh))) +
+#   geom_point() +
+#   theme_classic() +
+#   scale_color_distiller(palette = "Spectral")
+
+
+# get credible set sizes and intersection sizes
+gemma.v8.s.cred_set.overlaps = gemma.v8.s.cred_set %>%
+  group_by(intron) %>%
+  summarise(gtexv8_sig = sum(gtexv8_sig) > 0,
+            nafr = sum(afr, na.rm=T),
+            nv8 = sum(v8, na.rm=T),
+            nboth = sum(afr & v8, na.rm=T),
+            smaller = min(nafr, nv8))
+
+ggplot(gemma.v8.s.cred_set.overlaps,
+       aes(x=log10(nafr),
+           y=log10(nv8),
+           color=(smaller-nboth)/smaller,
+           shape=gtexv8_sig)) +
+  geom_abline(aes(intercept=0, slope=1), linetype="dashed", alpha=0.5) +
+  geom_point(alpha=0.8, size=2) +
+  scale_shape_manual(values = c(4, 1)) +
+  scale_color_distiller(palette = "Spectral") +
+  theme_classic(base_size=15) +
+  ggtitle("sQTL credible sets, Africans vs GTEx")
+
+
+
+
+# plot comparison
+data.frame(intron = unique(lc.sgenes$intron)[unique(lc.sgenes$intron) %in% mapped_introns$intron],
+           afr_cred_set = sapply(afr_cred_set.introns.all[unique(lc.sgenes$intron) %in% mapped_introns$intron],
+                                 function(x) length(x)),
+           gtexv8_cred_set = sapply( gtex.xv8.cred_set.introns.all, function(x) length(x))) %>%
+  merge(lc_gtexv8_h4.df.max) %>%
+  ggplot(aes(x=log10(afr_cred_set), y=log10(gtexv8_cred_set), color=hypothesis)) +
+  geom_point(alpha=0.6) +
+  geom_abline(aes(intercept=0, slope=1), color="red") +
+  theme_classic(base_size=15) +
+  ggtitle("sQTL credible set sizes")
+
+```
+
+
+colocalize with Fst
+
+```{r}
+
+lc.sgenes.fst = lc.sgenes %>%
+  merge(fst %>% select(chr, pos_hg19, ref, alt, eur_af, fst, fst_p)) %>%
+  filter(ref==allele0 & alt==allele1) %>%
+  select(c(gene_id, intron, fdr_sig, top_ssnp, snp_hg19, af, eur_af, fst, fst_p, p.value)) %>%
+  mutate(maf = ifelse(af < 0.5, af, 1-af),
+         eur_maf = ifelse(eur_af < 0.5, eur_af, 1-eur_af))
+
+lc_fst_h4 = lapply(unique(lc.sgenes.fst$intron), function(x){
+  df = lc.sgenes.fst %>%
+    filter(intron==x)
+  coloc.abf(dataset1=list(snp=df$snp_hg19, pvalues=df$p.value, type="quant", N=162, MAF=df$maf),
+            dataset2=list(snp=df$snp_hg19, pvalues=df$fst_p, type="quant", N=162, MAF=df$eur_maf))$summary
+})
+
+lc_fst_h4.df = data.frame(intron = unique(lc.sgenes.fst$intron),
+                          H0 = sapply(lc_fst_h4, function(x) x[2]),
+                          H1 = sapply(lc_fst_h4, function(x) x[3]),
+                          H2 = sapply(lc_fst_h4, function(x) x[4]),
+                          H3 = sapply(lc_fst_h4, function(x) x[5]),
+                          H4 = sapply(lc_fst_h4, function(x) x[6])) %>%
+  merge(lc.sgenes %>% select(c(intron, afr_intron)) %>% unique)
+
+```
+
+Scans of selection
+
+```{r}
+
+ihs_cols = c("chr","pos","alt_frq","ihh1","ihh0","ihs_raw","ihs_norm","thresh")
+
+lc.fdr05.ihs = tabix2df("../../ihs/ALL.wo_mhc.ihs.txt.gz",
+                           tabixify(lc.fdr05$chr, lc.fdr05$pos, lc.fdr05$pos),
+                           ihs_cols) %>%
+  mutate(snp_id = paste(chr, pos, sep=":"))
+
+```
+
+Are sQTLs more likely to be iHS outliers than random SNPs?
+
+```{r}
+
+# get the tag variants for all top sQTLs
+lc.fdr05.top.tags = tabix2df("../../geno/5M.imputed.dose.biallelic.tags.list.gz",
+                                tabixify(lc.fdr05.top$chr, lc.fdr05.top$pos, lc.fdr05.top$pos),
+                                c("snp_id","chr","pos","ntag","left","right","kbspan","tags")) %>%
+  separate_rows(tags, sep="\\|") %>%
+  mutate(tags = ifelse(tags=="NONE", snp_id, tags)) %>%
+  separate(tags, into=c("tag_chr","tag_pos"), sep=":", remove=F)
+                                
+
+# get iHS values for all tag variants
+ihs_cols = c("chr","pos","alt_frq","ihh1","ihh0","ihs_raw","ihs_norm","thresh")
+
+lc.fdr05.top.tags.ihs = tabix2df("../../ihs/ALL.interp.wo_mhc.ihs.txt.gz",
+                                 tabixify(lc.fdr05.top.tags$tag_chr, lc.fdr05.top.tags$tag_pos, lc.fdr05.top.tags$tag_pos),
+                                 ihs_cols)
+
+# get top iHS variant for each gene
+lc.fdr05.top.tags.ihs.top = lc.fdr05.top.tags.ihs %>%
+  mutate(tags = paste(chr, pos, sep=":")) %>%
+  select(c(tags, ihs_norm)) %>%
+  merge(lc.fdr05.top.tags, ., by="tags") %>%
+  group_by(snp_id) %>%
+  filter(abs(ihs_norm) == max(abs(ihs_norm))) %>%
+  sample_n(1)
+
+########################################################
+####################### Sampling #######################
+########################################################
+
+lc.ntag_frq = merge(lc.fdr05.top.tags.ihs.top %>% select(snp_id, ihs_norm), ntag_frq.ihs, by="snp_id")
+
+lc.ntag_frq = lc.ntag_frq %>%
+  mutate(maf_bin = factor(maf_bin, levels=levels(lc.ntag_frq$maf_bin)[-1]))
+
+lc.ntag_frq.samp = mapply(function(x, y) sample_idx(x, y), lc.ntag_frq$ntag_bin, lc.ntag_frq$maf_bin)
+
+lc.null.ihs = apply(lc.ntag_frq.samp, 1, function(x) ntag_frq.ihs[x,]$ihs_norm)
+lc.null.top_ihs = apply(lc.ntag_frq.samp, 1, function(x) ntag_frq.ihs[x,]$max_tag_ihs)
+
+foo = apply(lc.null.ihs, 2, function(x) mean(abs(x) > 2))
+bar = apply(lc.null.top_ihs, 2, function(x) mean(abs(x) > 2.42))
+
+ihs_outlier.df = rbind(data.frame(frac_outliers=bar, class="null"),
+                       data.frame(frac_outliers=mean(abs(lc.fdr05.top.tags.ihs.top$ihs_norm) > 2.42), class="obs"))
+
+ggplot() +
+  geom_histogram(data=ihs_outlier.df %>% filter(class=="null"), aes(x=frac_outliers)) +
+  geom_vline(data=ihs_outlier.df %>% filter(class=="obs"), aes(xintercept=frac_outliers), color="red") +
+  theme_classic(base_size=15)
+                 
+```
+
+Colocalization
+
+```{r}
+dstat.f = "/local1/derek/data/transcriptomics/eqtl/afr_wbrna/fst/Dstat/all_dstat.txt.gz"
+dstat = fread(dstat.f)
+
+threshs = lapply(pops, function(pop) dstat %>% pull(pop) %>% quantile(probs=c(0.99, 0.999)))
+
+lc.fdr05.dstat = tabix2df(dstat.f, tabixify(lc.fdr05$chr, lc.fdr05$pos, lc.fdr05$pos), dstat_cols) %>% 
+  mutate(snp_id = paste(chr, pos,sep=":")) %>%
+  select(-c(chr,pos)) %>%
+  merge(., lc.fdr05, by="snp_id")
+
+sqtl_dstat_cors = list()
+for (pop in pops){
+  
+  pop_sig_genes = lc.fdr05.dstat %>%
+    filter(!!as.name(pop) > threshs[[pop]][2]) %>%
+    pull(gene_id) %>%
+    unique
+  names(pop_sig_genes) = pop_sig_genes
+  
+  pop_sig.lc = lc.peer %>%
+    filter(gene_id %in% pop_sig_genes)
+  
+  pop_sig.lc.dstat = tabix2df(dstat.f,
+                           tabixify(pop_sig.lc$chr,
+                                    pop_sig.lc$pos,
+                                    pop_sig.lc$pos),
+                           dstat_cols) %>%
+    mutate(snp_id = paste(chr, pos, sep=":")) %>%
+    merge(pop_sig.lc, ., by="snp_id") %>%
+    merge(., gene_name, by="gene_id")
+  
+  locus_plots = ggplot(pop_sig.lc.dstat, aes(x=!!sym(pop), y=-log10(p.value))) +
+    geom_point() +
+    geom_hline(yintercept=-log10(fdr_thresh), color="red",  linetype="dashed") +
+    geom_vline(xintercept=threshs[[pop]][2], color="red",  linetype="dashed") +
+    geom_vline(xintercept=threshs[[pop]][1], color="blue", linetype="dashed") +
+    theme_classic() +
+    facet_wrap(~ name, scales="free")
+  
+    sqtl_dstat_cors[[pop]] = locus_plots
+  }
+
+```
+
+credible sets
+
+```{r}
+
+sintrons = lc.sgenes %>%
+  pull(intron) %>%
+  unique
+
+afr_cred_set.introns.all  = lapply(sintrons,
+                                   function(x){
+                                     df.tmp = lc.sgenes %>%
+                                       filter(intron==x)
+                                     get_cred_set.p(df.tmp$sqtl_hg19,
+                                                    df.tmp$p.value,
+                                                    df.tmp$maf, 162, 0.9)})
+
+# get dstat info
+afr_credset_fst.introns = lc.sgenes %>%
+  filter(sqtl_hg19 %in% unlist(afr_cred_set.introns.all)) %>%
+  mutate(snp_hg19 = paste(chr, pos_hg19, sep=":")) %>%
+  merge(tags %>% select(snp_hg19 = snp, fst)) %>%
+  unique %>%
+  group_by(intron) %>%
+  summarise(mean_fst = mean(fst, na.rm=T),
+            n = n(),
+            min_fst = min(fst, na.rm=T))
+
+```

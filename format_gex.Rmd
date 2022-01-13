@@ -1,0 +1,215 @@
+---
+title: "Format GEx data"
+output: html_notebook
+---
+
+# Necessary packages
+
+```{r}
+
+library(tidyverse)
+
+```
+
+
+# Paths to data
+
+```{r}
+
+# gene expression data as TPM from RSEM
+tpm.f = "./data/Sample_ALL.secondpass.rsem.genes.results.tpm"
+
+# gene expression data as feature counts
+feats.f = "./data/Sample_ALL.secondpass.featurecounts.merge.txt"
+
+```
+
+
+# Read in and filter data
+
+```{r}
+
+tpm = read_tsv(tpm.f) %>%
+  select(-2) %>%
+  mutate(gene_id = strip_ensembl(gene_id))
+               
+tpm.median = tpm %>%
+  gather(key="sample", value="tpm", -gene_id) %>%
+  group_by(gene_id) %>%
+  summarise(median_tpm = median(tpm))
+
+feats = read.delim(feats.f, stringsAsFactors=F) %>%
+  mutate(gene_id = strip_ensembl(gene_id))
+
+# tpm.gini = tpm %>%
+#   gather(key="sample", value="tpm", -gene_id) %>%
+#   group_by(gene_id) %>%
+#   summarise(tpm_gini = gini(tpm))
+
+# 
+#   mutate(gene_id=strip_ensembl(Name)) %>%
+#   select(-Name)
+# gtex.v8.tpm = gtex.v8.all.tpm %>%
+#   select(gene_id, gtexv8_tpm=`Whole Blood`)
+
+## find genes that pass thresholds:
+## 1. reads > 5 in at least 20 individuals
+## 2. mean TPM > 0.1 in all populations
+
+genes.reads_gt5in20 = feats %>%
+  gather(key="sample", value="counts", -gene_id) %>%
+  filter(sample %in% pop_samps$sample) %>%
+  group_by(gene_id) %>%
+  summarise(counts_gt5 = sum(counts > 5)) %>%
+  filter(counts_gt5 >= 20) %>%
+  pull(gene_id)
+
+genes.tpm_gt01inpops = tpm %>%
+  gather(key="sample", value="tpm", -gene_id) %>%
+  filter(sample %in% pop_samps$sample) %>%
+  merge(pop_samps) %>%
+  group_by(gene_id, pop) %>%
+  summarise(mean_tpm = mean(tpm)) %>%
+  ungroup %>%
+  group_by(gene_id) %>%
+  summarise(mean_tpm_gt01 = sum(mean_tpm > 0.1)) %>%
+  filter(mean_tpm_gt01 == 9) %>%
+  pull(gene_id)
+
+## get gene IDs meeting all thresholds
+genes.filt = Reduce(intersect, x=list(genes.reads_gt5in20, ## reads > 5 in at least 20 samples
+                                      genes.tpm_gt01inpops, ## mean TPM > 0.1 in all pops
+                                      gencode.pc_linc %>%
+                                        filter(grepl('[0-9]', chr)) %>%
+                                        pull(gene_id))) ## autosomal, protein-coding, and lincRNAs
+
+## filter TPM and read counts and make tidy
+tpm.filt = tpm %>%
+  filter(gene_id %in% genes.filt)
+
+feats.filt = feats %>%
+  filter(gene_id %in% genes.filt)
+
+```
+
+
+# Quantile normalize
+
+```{r}
+  
+tpm.filt.sub = tpm.filt %>%
+  select(samps)
+
+mean_dist = apply(tpm.filt.sub, 1, mean)
+
+norm_dist = qnorm(ppoints(length(samps)))
+
+tpm.filt.qnn = tpm.filt.sub %>%
+  sapply(., quant_norm_rand, dist=mean_dist) %>%
+  apply(., 1, quant_norm_rand, dist=norm_dist) %>%
+  t %>%
+  as.data.frame %>%
+  setNames(samps) %>%
+  cbind(data.frame(gene_id=tpm.filt$gene_id), .)
+
+```
+
+
+# Next is to calculate PEER factors on the quantile-normalized matrix:
+
+```{r}
+
+tpm.filt.peer30 = tpm.filt.qnn %>%
+  select(samps) %>%
+  as.matrix %>%
+  t %>%
+  run_peer(., num_factors=30)
+
+```
+
+
+# Now, combine PEER factors with other covariates and regress them out of gene expression data:
+
+```{r}
+
+## covariates include sex, age, collection date, and cell type fractions
+sex_age = read_table("./data/covariates.sex_age", col_names=c("group","sample","foo","sex","age")) %>%
+  select(c(sample, sex, age))
+
+date = read_tsv("./data/delivery_date.txt", col_names=c("sample","date"))
+
+ctypes = read_csv("./data/all.secondpass.rsem.genes.noribo.LM22.cibersort.csv") %>%
+  select(-c(`P-value`, `Pearson Correlation`, RMSE)) %>%
+  rename(sample=`Input Sample`)
+names(ctypes) = make.names(names(ctypes), unique=T)
+
+## combine covariates
+covars = Reduce(function(...) merge(..., by="sample"),
+                list(sex_age, date, ctypes))
+covars = covars[match(samps, covars$sample),]
+
+## get covariates togther
+dir.create("covars")
+covars_list = list()
+for (i in 1:30){
+  
+  peer=paste0("peer", i)
+  
+  covars_list[[peer]] = tpm.filt.peer30[,1:i] %>%
+    as.data.frame %>%
+    setNames(paste0("peer", 1:i)) %>%
+    mutate(sample=samps) %>%
+    merge(covars, ., by="sample", sort=F)
+  
+  write.table(covars_list[[peer]], file.path("covars", paste(c("covars.sex.age.date.cibersort.peer",i,".txt"), collapse="")),
+              quote=F, row.names=F, sep="\t")
+}
+
+## also write covariates with 0 peer factors
+covars_list[["peer0"]] = covars
+  
+write.table(covars, file.path("covars", "covars.sex.age.date.cibersort.peer0.txt"),
+            quote=F, row.names=F, sep="\t")
+
+
+## transpose matrix
+tpm.filt.qnn.wide = tpm.filt.qnn %>%
+  gather(key="sample", value="tpm_norm", -gene_id) %>%
+  spread(gene_id, tpm_norm)
+
+## make sure the samples match and create matrix
+gex.mat = merge(data.frame(sample=samps, stringsAsFactors=F),
+                tpm.filt.qnn.wide, by="sample", sort=F) %>%
+  select(-sample) %>%
+  as.matrix
+
+
+for (peer in names(covars_list)){
+
+  ## make directory to write out residualized phenotypes  
+  dir.create(file.path("pheno_resid", peer))
+  
+  ## keep all of the samples straight
+  samp.temp = covars_list[[peer]]$sample
+  
+  ## convert covariate file to matrix
+  covar.mat = covars_list[[peer]] %>%
+    select(-c(sample,date)) %>%
+    cbind(., model.matrix(~factor(date), covars_list[[peer]])) %>% ## date must be expanded as dummy variables. Also adds intercept term
+    as.matrix
+    
+  ## residualize
+  resid.mat = gex.mat - covar.mat %*% solve(t(covar.mat) %*% covar.mat) %*% t(covar.mat) %*% gex.mat
+  resid.df = cbind(data.frame(sample=samp.temp), as.data.frame(resid.mat)) %>%
+    setNames(names(tpm.filt.qnn.wide))
+  
+  ## write out residualized data
+  gather(resid.df, key="gene_id", value="tpm_norm", -sample) %>%
+    spread(sample, tpm_norm) %>%
+    merge(gencode.pc_linc %>% select(c(chr, start, end, strand, gene_id)), ., by="gene_id") %>% ## add gene position information
+    select(c("chr","start","end","strand","gene_id", samps)) %>% ## reorder columns
+    mutate(chr = gsub("chr","",chr)) %>% ## remove the "chr"
+    write.table(., file.path("pheno_resid", peer, paste(c("Sample_ALL.secondpass.rsem.genes.results.tpm.covars", peer, "resid.txt"), collapse=".")),
+                sep="\t", quote=F, row.names=F)
+}
+```
