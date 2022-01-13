@@ -1,0 +1,3316 @@
+ARICAN WHOLE-BLOOD RNA-SEQ -*- mode: org -*-
+
+* Overview
+
+#+NAME paths
+#+BEGIN_SRC sh
+
+# master directories
+PROJDIR="/project/tishkofflab/rna_redo/afr_wbrna"
+READDIR="/project/tishkofflab/afiimani/STUDY/reads"
+
+# code directories
+PIPEDIR=${PROJDIR}/pipeline
+ERRDIR=${PIPEDIR}/err
+LOGDIR=${PIPEDIR}/log
+
+# data directories
+DATADIR=${PROJDIR}/data
+TEMPDIR=${DATADIR}/tmp
+SAMPDIR=${DATADIR}/samples
+MISCDIR=${DATADIR}/misc
+GENDIR=${DATADIR}/geno
+GENODIR=${DATADIR}/genomes
+RASQDIR=${DATADIR}/rasqual
+METADIR=${DATADIR}/metal
+LEAFDIR=${DATADIR}/leafcutter
+FASTDIR=${DATADIR}/fastqtl
+FSTDIR=${DATADIR}/fst
+EQTLDIR=${DATADIR}/eqtl
+CHUNKDIR=${DATADIR}/chunks
+
+# list of samples
+readarray -t SAMPLES<${MISCDIR}/samples.txt
+readarray -t SAMPS<${MISCDIR}/samps.txt
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+
+#+END_SRC
+
+#+RESULTS:
+: /project/tishkofflab/rna_redo/afr_wbrna/data/tmp
+
+  
+* Read Mapping
+
+** Filter ribosomal reads
+
+# First ribosomal ids must be sorted for quick filtering:
+
+# #+BEGIN_SRC sh
+# for SAMPLE in ${SAMPLES[@]};
+# do
+
+# OUTDIR=${SAMPDIR}/${SAMPLE}
+# mkdir -p $OUTDIR
+
+# IN=${READDIR}/${SAMPLE}/${SAMPLE}.ribosomalids.txt
+# OUT=${OUTDIR}/${SAMPLE}.ribosomalids.sort.txt.gz
+
+# bsub -o ${LOGDIR}/sort_ribo.${SAMPLE}.log \
+# -e ${ERRDIR}/sort_ribo.${SAMPLE}.err \
+# bash sort_ribo.sh $IN $OUT
+
+# done
+# #+END_SRC
+
+Reads are filtered using the faSomeRecords utility:
+
+#+BEGIN_SRC sh
+for SAMPLE in ${SAMPLES[@]};
+do
+
+OUTDIR=${SAMPDIR}/${SAMPLE}
+mkdir -p $OUTDIR
+
+RIBO=${OUTDIR}/${SAMPLE}.ribosomalids.sort.txt.gz
+
+FORIN=${READDIR}/${SAMPLE}/forward.fa.gz
+REVIN=${READDIR}/${SAMPLE}/reverse.fa.gz
+FOROUT=${OUTDIR}/forward.noribo.fa
+REVOUT=${OUTDIR}/reverse.noribo.fa
+
+bsub -o ${LOGDIR}/filter_ribo.${SAMPLE}.forward.log \
+-e ${ERRDIR}/filter_ribo.${SAMPLE}.forward.err \
+bash filter_ribo.sh $FORIN $RIBO $FOROUT
+
+bsub -o ${LOGDIR}/filter_ribo.${SAMPLE}.reverse.log \
+-e ${ERRDIR}/filter_ribo.${SAMPLE}.reverse.err \
+bash filter_ribo.sh $REVIN $RIBO $REVOUT
+
+done
+#+END_SRC
+
+
+** STAR
+
+*** Generate Genome for first pass
+    
+#+BEGIN_SRC shell
+    bsub -n 9 \
+    -M 61440 \
+    -o ${LOGDIR}/generate_STAR_genome_firstpass.log \
+    -e ${ERRDIR}/generate_STAR_genome_firstpass.err \
+    bash ${PIPEDIR}/generate_STAR_genome_firstpass.sh
+#+END_SRC
+
+*** First pass STAR mapping
+
+Map all chunks using STAR (excluding Kaba samples).
+
+#+BEGIN_SRC shell
+for i in $(seq 1 10);
+do
+
+bsub -n 17 \
+-M 35840 \
+-R span[hosts=1] \
+-e ${ERRDIR}/chunk${i}_firstpass.err \
+-o ${LOGDIR}/chunk${i}_firstpass.log \
+bash ${PIPEDIR}/map_chunk_STAR_firstpass.sh \
+${CHUNKDIR}/chunk${i}.txt \
+$SAMPDIR \
+$SAMPDIR
+
+done
+#+END_SRC
+
+From the first mapping I need the junction reads.
+
+#+BEGIN_SRC shell
+mkdir -p ${SAMPDIR}/Sample_ALL
+
+cat ${SAMPDIR}/*/firstpassSJ.out.tab | \
+awk '{ if ($4==1) print $1 "\t" $2 "\t" $3 "\+";
+else print $1 "\t" $2 "\t" $3 "\t-"; }' | \
+sort -k1,1 -k2,2n -k3,3n | \
+uniq > ${SAMPDIR}/Sample_ALL/firstpassSJ.all.canon.1reads.2samp.out.tab
+
+# cat ${bsub -e ${ERRDIR}/filter_SJ.err \
+# -o ${LOGDIR}/filter_SJ.log \
+# bash ${PIPE}/filter_SJ.sh
+#+END_SRC
+
+Convert sam files to bam files from the first pass.
+
+#+BEGIN_SRC shell
+readarray -t UNFINSAMPS<${MISCDIR}/samps_to_be_filtered.2.12.17.txt
+
+for SAMPLE in ${SAMPLES[@]};
+
+do
+
+IN=${SAMPDIR}/${SAMPLE}/firstpassAligned.out.sam
+OUT=${SAMPDIR}/${SAMPLE}/firstpassAligned.out.bam
+
+bsub bash sam2bam.sh $IN $OUT
+
+done
+#+END_SRC
+
+Quickcheck the integrity of bam files
+
+#+BEGIN_SRC sh
+
+BAMFILES=$( ls ${SAMPDIR}/*/firstpass*bam )
+echo $BAMFILES
+
+samtools quickcheck -v $BAMFILES > ${MISCDIR}/firstpass_bam_quickcheck_fail.txt
+
+#+END_SRC
+
+Next, generate a STAR genome using these junctions
+
+#+BEGIN_SRC shell
+bsub -n 9 \
+-M 102400 \
+-o ${LOGDIR}/generate_STAR_genome_secondpass.log \
+-e ${ERRDIR}/generate_STAR_genome_secondpass.err \
+bash ${PIPEDIR}/generate_STAR_genome_secondpass.sh
+#+END_SRC
+
+*** Second pass STAR mapping
+
+Perform the second pass of mapping.
+
+#+BEGIN_SRC shell
+for i in $(seq 1 10);
+do
+
+bsub -n 17 \
+-M 35840 \
+-R span[hosts=1] \
+-e ${ERRDIR}/chunk${i}_secondpass.err \
+-o ${LOGDIR}/chunk${i}_secondpass.log \
+bash ${PIPEDIR}/map_chunk_STAR_secondpass.sh \
+${CHUNKDIR}/chunk${i}.txt \
+$SAMPDIR \
+$SAMPDIR
+
+done
+#+END_SRC
+
+*** STAR output filtering
+
+In order to quantify gene expression, SAM files must be appropriately
+filtered and converted to BAM files. This includes
+addition of fake read groups, which is required for GATK
+ASEReadCounter. Note that this does not need to be done with the files
+mapped to the transcriptome (used for RSEM) but only for the files
+aligned to the genome.
+
+#+NAME: filter STAR reads
+#+BEGIN_SRC shell
+#readarray -t SAMPFIN<${MISCDIR}/finished_samps.2.10.17.txt
+#readarray -t SAMPFIN<${MISCDIR}/samps_to_be_filtered.2.12.17.txt
+#readarray -t SAMPFIN<${MISCDIR}/samps_for_allelecount.2.13.17.txt
+
+for SAMPLE in ${SAMPLES[@]};
+do
+
+bsub -n 9 -M 10240 \
+-o ${LOGDIR}/filter_starout.${SAMPLE}.log \
+-e ${ERRDIR}/filter_starout.${SAMPLE}.err \
+bash filter_starout.sh $SAMPDIR $SAMPLE
+
+done
+#+END_SRC shell
+
+Convert all sam files to bam files
+
+#+BEGIN_SRC shell
+for SAMPLE in ${SAMPLES[@]};
+do
+
+SAM=${SAMPDIR}/${SAMPLE}/secondpassAligned.out.sam
+BAM=${SAMPDIR}/${SAMPLE}/secondpassAligned.out.bam
+
+bsub samtools view -bho $BAM $SAM
+
+done
+#+END_SRC
+
+Quickcheck the integrity of bam files
+
+#+BEGIN_SRC sh 
+
+samtools quickcheck -v ${SAMPDIR}/*/secondpass*bam > ${MISCDIR}/secondpass_bam_quickcheck_fail.txt
+
+#+END_SRC
+
+Remove sam files
+
+#+BEGIN_SRC sh 
+
+ls ${SAMPDIR}/*/*sam
+rm ${SAMPDIR}/*/*sam
+
+#+END_SRC
+
+*** Redo everything, use WASP filtering
+
+I can't resolve the bias in effect size direction so I'm remapping
+with WASP filtering.
+
+**** Generate Genome for first pass
+
+#+BEGIN_SRC 
+    bsub -n 9 \
+    -M 61440 \
+    -o ${LOGDIR}/generate_STAR_genome_firstpass.v2.7.log \
+    -e ${ERRDIR}/generate_STAR_genome_firstpass.v2.7.err \
+    bash ${PIPEDIR}/generate_STAR_genome_firstpass.v2.7.sh
+#+END_SRC
+
+**** First pass STAR mapping
+
+Map all chunks using STAR (excluding Kaba samples).
+
+#+BEGIN_SRC shell
+for i in $(seq 1 10);
+do
+
+bsub -n 17 \
+-M 35840 \
+-R span[hosts=1] \
+-e ${ERRDIR}/chunk${i}_firstpass_wasp.err \
+-o ${LOGDIR}/chunk${i}_firstpass_wasp.log \
+bash ${PIPEDIR}/map_chunk_STAR_firstpass.v2.7.sh \
+${CHUNKDIR}/chunk${i}.txt \
+$SAMPDIR
+
+done
+#+END_SRC
+
+From the first mapping I need the junction reads.
+
+#+BEGIN_SRC shell
+mkdir -p ${SAMPDIR}/Sample_ALL
+
+cat ${SAMPDIR}/*/firstpassSJ.out.tab | \
+awk '{ if ($4==1) print $1 "\t" $2 "\t" $3 "\+";
+else print $1 "\t" $2 "\t" $3 "\t-"; }' | \
+sort -k1,1 -k2,2n -k3,3n | \
+uniq > ${SAMPDIR}/Sample_ALL/firstpassSJ.all.canon.1reads.2samp.out.tab
+
+# cat ${bsub -e ${ERRDIR}/filter_SJ.err \
+# -o ${LOGDIR}/filter_SJ.log \
+# bash ${PIPE}/filter_SJ.sh
+#+END_SRC
+
+Convert sam files to bam files from the first pass.
+
+#+BEGIN_SRC shell
+readarray -t UNFINSAMPS<${MISCDIR}/samps_to_be_filtered.2.12.17.txt
+
+for SAMPLE in ${SAMPLES[@]};
+
+do
+
+IN=${SAMPDIR}/${SAMPLE}/firstpassAligned.out.sam
+OUT=${SAMPDIR}/${SAMPLE}/firstpassAligned.out.bam
+
+bsub bash sam2bam.sh $IN $OUT
+
+done
+#+END_SRC
+
+Quickcheck the integrity of bam files
+
+#+BEGIN_SRC sh 
+
+BAMFILES=$( ls ${SAMPDIR}/*/firstpass*bam )
+echo $BAMFILES
+
+samtools quickcheck -v $BAMFILES > ${MISCDIR}/firstpass_bam_quickcheck_fail.txt
+
+#+END_SRC
+
+Next, generate a STAR genome using these junctions
+
+#+BEGIN_SRC shell
+bsub -n 9 \
+-M 102400 \
+-o ${LOGDIR}/generate_STAR_genome_secondpass.log \
+-e ${ERRDIR}/generate_STAR_genome_secondpass.err \
+bash ${PIPEDIR}/generate_STAR_genome_secondpass.sh
+#+END_SRC
+
+
+* RSEM quantification
+
+Build an RSEM reference
+
+#+NAME: build RSEM reference
+#+BEGIN_SRC shell
+GCODEDIR=${GENODIR}/gencode
+RSEMDIR=${GENODIR}/rsem
+
+mkdir -p $RSEMDIR
+
+bsub -o ${LOGDIR}/rsem_prepare_reference.log \
+-e ${ERRDIR}/rsem_prepare_reference.err \
+rsem-prepare-reference --gtf ${GCODEDIR}/gencode.v19.transcripts.patched_contigs.gtf \
+--transcript-to-gene-map ${GCODEDIR}/gencode.v19.annotation.knownIsoforms.txt \
+${GENODIR}/Homo_sapiens_assembly19.fasta ${RSEMDIR}/hg19.gencode.v19
+#+END_SRC
+
+Quantify transcript abundance with RSEM
+
+#+NAME: RSEM_quantification
+#+BEGIN_SRC shell
+readarray -t SAMPLES<${MISCDIR}/samples.txt
+  
+for SAMPLE in ${SAMPLES[@]};
+do
+
+BAM=${SAMPDIR}/${SAMPLE}/secondpassAligned.toTranscriptome.out.255.bam
+GENO=${GENODIR}/rsem/hg19.gencode.v19
+OUT=${SAMPDIR}/${SAMPLE}/${SAMPLE}.secondpass.rsem
+
+BAMSIZE=$(ls -la ${BAM} | cut -d' ' -f5)
+let "BAMSIZE = ($BAM_SIZE + 3221225472)/1024/1024"
+
+bsub -M $BAMSIZE -n 9 -R span[hosts=1] \
+-o ${LOGDIR}/${SAMPLE}.rsem_call.log \
+-e ${ERRDIR}/${SAMPLE}.rsem_call.err \
+bash rsem_call.sh $BAM $GENO $OUT
+
+done
+#+END_SRC
+
+Merge TPM into a single file (and likewise for FPKM values).
+
+#+begin_src shell
+readarray -t SAMPLES<${MISCDIR}/samples.txt
+
+# define some directories
+OUTDIR=${SAMPDIR}/Sample_ALL
+
+# define some output files
+OUT_GENE_FPKM=${OUTDIR}/Sample_ALL.secondpass.rsem.genes.results.fpkm
+OUT_GENE_TPM=${OUTDIR}/Sample_ALL.secondpass.rsem.genes.results.tpm
+OUT_ISO_FPKM=${OUTDIR}/Sample_ALL.secondpass.rsem.isoforms.results.fpkm
+OUT_ISO_TPM=${OUTDIR}/Sample_ALL.secondpass.rsem.isoforms.results.tpm
+
+# define some temporary shell script paths
+GENE_FPKM_SH=${OUTDIR}/gene_fpkm_combine.sh
+GENE_TPM_SH=${OUTDIR}/gene_tpm_combine.sh
+ISO_FPKM_SH=${OUTDIR}/iso_fpkm_combine.sh
+ISO_TPM_SH=${OUTDIR}/iso_tpm_combine.sh
+
+echo "paste \\" > $GENE_FPKM_SH
+echo "paste \\" > $GENE_TPM_SH
+echo "paste \\" > $ISO_FPKM_SH
+echo "paste \\" > $ISO_TPM_SH
+
+# read in the sample names to process
+readarray -t SAMPLES<${MISCDIR}/samples.txt
+
+# print out the header of the output files
+echo -e "gene_id\ttranscript_id(s)\t${SAMPLES[@]}" > $OUT_GENE_FPKM
+echo -e "gene_id\ttranscript_id(s)\t${SAMPLES[@]}" > $OUT_GENE_TPM
+echo -e "transcript_id(s)\tgene_id\t${SAMPLES[@]}" > $OUT_ISO_FPKM
+echo -e "transcript_id(s)\tgene_id\t${SAMPLES[@]}" > $OUT_ISO_TPM
+
+# for first sample, print out the gene and isoform names
+echo "<(tail -n +2 ${SAMPDIR}/${SAMPLES[0]}/${SAMPLES[0]}.secondpass.rsem.genes.results | cut -f1,2,7) \\" >> $GENE_FPKM_SH
+echo "<(tail -n +2 ${SAMPDIR}/${SAMPLES[0]}/${SAMPLES[0]}.secondpass.rsem.genes.results | cut -f1,2,6) \\" >> $GENE_TPM_SH
+echo "<(tail -n +2 ${SAMPDIR}/${SAMPLES[0]}/${SAMPLES[0]}.secondpass.rsem.isoforms.results | cut -f1,2,7) \\" >> $ISO_FPKM_SH
+echo "<(tail -n +2 ${SAMPDIR}/${SAMPLES[0]}/${SAMPLES[0]}.secondpass.rsem.isoforms.results | cut -f1,2,6) \\" >> $ISO_TPM_SH
+
+# iterate over all other samples, printin the TPM or FPKM values
+for SAMPLE in ${SAMPLES[@]:1};
+do
+    
+    echo "<(tail -n +2 ${SAMPDIR}/${SAMPLE}/${SAMPLE}.secondpass.rsem.genes.results | cut -f7) \\" >> $GENE_FPKM_SH
+    echo "<(tail -n +2 ${SAMPDIR}/${SAMPLE}/${SAMPLE}.secondpass.rsem.genes.results | cut -f6) \\" >> $GENE_TPM_SH
+    echo "<(tail -n +2 ${SAMPDIR}/${SAMPLE}/${SAMPLE}.secondpass.rsem.isoforms.results | cut -f7) \\" >> $ISO_FPKM_SH
+    echo "<(tail -n +2 ${SAMPDIR}/${SAMPLE}/${SAMPLE}.secondpass.rsem.isoforms.results | cut -f6) \\" >> $ISO_TPM_SH
+
+done
+
+echo ">> ${OUT_GENE_FPKM}" >> $GENE_FPKM_SH
+echo ">> ${OUT_GENE_TPM}" >> $GENE_TPM_SH
+echo ">> ${OUT_ISO_FPKM}" >> $ISO_FPKM_SH
+echo ">> ${OUT_ISO_TPM}" >> $ISO_TPM_SH
+
+sed -i "s/ /\t/g" $OUT_GENE_FPKM
+sed -i "s/ /\t/g" $OUT_GENE_TPM
+sed -i "s/ /\t/g" $OUT_ISO_FPKM
+sed -i "s/ /\t/g" $OUT_GENE_FPKM
+
+sed -i "s/Sample_//g" $OUT_GENE_FPKM
+sed -i "s/Sample_//g" $OUT_GENE_TPM
+sed -i "s/Sample_//g" $OUT_ISO_FPKM
+sed -i "s/Sample_//g" $OUT_GENE_FPKM
+
+bsub bash $GENE_FPKM_SH
+bsub bash $GENE_TPM_SH
+bsub bash $ISO_FPKM_SH
+bsub bash $ISO_TPM_SH
+#+end_src
+
+
+FeatureCount quantification
+
+#+begin_src 
+readarray -t SAMPLES<${MISCDIR}/samples.txt
+
+GTF=${GENODIR}/gencode/gencode.v19.genes.v7.patched_contigs.gtf
+
+for SAMPLE in ${SAMPLES[@]};
+do
+
+SAMPOUT=${SAMPDIR}/${SAMPLE}
+
+bsub -o ${LOGDIR}/${SAMPLE}_featureCounts.log \
+-e ${ERRDIR}/${SAMPLE}_featureCounts.err \
+featureCounts -p \
+-T 8 \
+-t exon \
+-g gene_id \
+-a $GTF \
+-o ${SAMPOUT}/${SAMPLE}.secondpass.featurecounts.txt ${SAMPDIR}/${SAMPLE}/secondpassAligned.out.255.sort.rg.bam
+
+done
+#+end_src
+
+Merge featurecounts
+
+#+begin_src 
+PASTE_SH=${SAMPDIR}/Sample_ALL/merge_featureCounts.sh
+
+echo -e "gene_id\t${SAMPLES[@]}" > ${SAMPDIR}/Sample_ALL/Sample_ALL.secondpass.featurecounts.merge.txt
+sed -i "s/Sample_//g" ${SAMPDIR}/Sample_ALL/Sample_ALL.secondpass.featurecounts.merge.txt
+sed -i "s/ /\t/g" ${SAMPDIR}/Sample_ALL/Sample_ALL.secondpass.featurecounts.merge.txt
+
+echo "paste <(tail -n +3 ${SAMPDIR}/${SAMPLES[0]}/${SAMPLES[0]}.secondpass.featurecounts.txt | cut -f1) \\" > $PASTE_SH
+
+for SAMPLE in ${SAMPLES[@]};
+do
+
+echo "<(tail -n +3 ${SAMPDIR}/${SAMPLE}/${SAMPLE}.secondpass.featurecounts.txt | cut -f7) \\" >> $PASTE_SH
+
+done
+
+echo ">> ${SAMPDIR}/Sample_ALL/Sample_ALL.secondpass.featurecounts.merge.txt" >> $PASTE_SH
+
+bsub -o ${LOGDIR}/merge_featurecounts.log \
+-e ${ERRDIR}/merge_featurecounts.err \
+bash $PASTE_SH
+#+end_src
+
+
+* RASQUAL
+  
+** extract genotype information for each population
+
+#+NAME: extract_genotypes
+#+BEGIN_SRC shell
+INFILE=${DATADIR}/geno/5M.imputed.dose.biallelic.vcf.gz
+
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+for POP in ${POPS[@]};
+do
+
+bsub \
+-e ${ERRDIR}/${POP}_extract_geno.err \
+-o ${LOGDIR}/${POP}_extract_geno.log \
+bash extract_geno.sh \
+$INFILE \
+$DATADIR \
+$POP
+
+done
+#+END_SRC
+
+I also need to get the correct order for individuals in the
+populations
+
+#+begin_src shell
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+for POP in ${POPS[@]};
+do
+
+zcat ${GENDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.vcf.gz | \
+head -n 20 | \
+grep "#" | \
+tail -n 1 | \
+cut -f10- | \
+sed 's/\t/\n/g' > ${MISCDIR}/pops/in5M/${POP}.txt
+
+done
+#+end_src
+
+For the combined eQTL mappign across all 162 I need to filter variants
+with less thatn 0.05 MAF
+
+#+BEGIN_SRC  sh
+
+VCFIN=${GENDIR}/5M.imputed.dose.biallelic.vcf.gz
+VCFOUT=${GENDIR}/5M.imputed.dose.biallelic.maf05
+
+bsub -o ${LOGDIR}/filter_vcf_maf05.log \
+-e ${ERRDIR}/filter_vcf_maf05.err \
+vcftools \
+--gzvcf $VCFIN \
+--maf 0.05 \
+--recode \
+--out $VCFOUT
+
+#+END_SRC
+
+** generating allele-specific read count files
+
+First we must index the fasta file for use with GATK using picard
+
+#+NAME: index_fasta
+#+BEGIN_SRC shell
+samtools faidx ${GENODIR}/Homo_sapiens_assembly19.fasta
+
+java -jar ~/bin/picard.jar CreateSequenceDictionary \
+R=${GENODIR}/Homo_sapiens_assembly19.fasta \
+O=${GENODIR}/Homo_sapiens_assembly19.dict
+#+END_SRC
+
+Next I need to run allelecounter for each file
+
+#+begin_src sh
+source $HOME/my_python-2.7.9/bin/activate
+
+readarray -t POPS<${MISCDIR}/all_pops.txt
+#readarray -t POPS<${MISCDIR}/pops_for_allelecount.2.13.17.txt
+
+for POP in ${POPS[@]};
+do
+
+    readarray -t SAMPS<${MISCDIR}/pops/in5M/${POP}.txt
+    #readarray -t SAMPS<${MISCDIR}/${POP}_for_allelecounter.txt
+
+    for SAMPLE in ${SAMPS[@]};
+    do
+
+	VCF=${GENDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.vcf.gz
+	BAM=${SAMPDIR}/Sample_${SAMPLE}/secondpassAligned.out.255.sort.rg.bam
+	REF=${GENODIR}/Homo_sapiens_assembly19.fasta
+	OUT=${SAMPDIR}/Sample_${SAMPLE}/${POP}.5M.imputed.dose.biallelic.recode.allelecount.txt
+
+	bsub -o ${LOGDIR}/${SAMPLE}_allelecounter.log \
+	     -e ${ERRDIR}/${SAMPLE}_allelecounter.err \
+	     python ~/bin/allelecounter/allelecounter.py \
+	     --vcf $VCF \
+	     --sample $SAMPLE \
+	     --bam $BAM \
+	     --ref $REF \
+	     --min_cov 2 \
+	     --min_baseq 0 \
+	     --min_mapq 0 \
+	     --max_depth 100000 \
+	     --o $OUT
+
+    done
+done
+#+end_src
+
+I'll also run allelecounter for all individuals at once.
+
+#+BEGIN_SRC sh 
+source $HOME/my_python-2.7.9/bin/activate
+
+readarray -t SAMPS<${MISCDIR}/samps.txt
+
+for SAMPLE in ${SAMPS[@]};
+do
+
+    VCF=${GENDIR}/5M.imputed.dose.biallelic.maf05.vcf.gz
+    BAM=${SAMPDIR}/Sample_${SAMPLE}/secondpassAligned.out.255.sort.rg.bam
+    REF=${GENODIR}/Homo_sapiens_assembly19.fasta
+    OUT=${SAMPDIR}/Sample_${SAMPLE}/${SAMPLE}.5M.imputed.dose.biallelic.allelecount.txt
+
+    bsub -o ${LOGDIR}/${SAMPLE}_allelecounter.log \
+	 -e ${ERRDIR}/${SAMPLE}_allelecounter.err \
+	 python ~/bin/allelecounter/allelecounter.py \
+	 --vcf $VCF \
+	 --sample $SAMPLE \
+	 --bam $BAM \
+	 --ref $REF \
+	 --min_cov 2 \
+	 --min_baseq 0 \
+	 --min_mapq 0 \
+	 --max_depth 100000 \
+	 --o $OUT
+
+done
+
+#+END_SRC
+
+** compute covariates
+   
+*** principal component analysis
+
+Convert VCF to PED format and filter appropriately. This includes
+converting to PED, filtering by pariwise LD (plink --indep-pairwise
+200 100 0.2), and filtering by HWE
+
+#+begin_src sh
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+# generate PED file for each population, filtering out ambiguous 
+for POP in ${POPS[@]};
+do
+
+    VCF=${GENDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.vcf.gz
+    OUT=${GENDIR}/${POP}/${POP}.5M.imputed.dose.noambig
+
+    bsub -o ${LOGDIR}/${POP}_vcf2ped.log \
+	 -e ${ERRDIR}/${POP}_vcf2ped.err \
+	 bash vcf2ped.sh $VCF $OUT
+
+done
+
+# filter PED file for each population
+for POP in ${POPS[@]};
+do
+
+    INPREF=${GENDIR}/${POP}/${POP}.5M.imputed.dose.noambig
+    OUTPREF=${GENDIR}/${POP}/${POP}.5M.imputed.dose.noambig.ldprune.hwe
+
+    bsub -o ${LOGDIR}/${POP}_filter_ped.log \
+	 -e ${ERRDIR}/${POP}_filter_ped.err \
+	 plink --file $INPREF \
+	 --indep-pairwise 200 100 0.2 \
+	 --hwe 0.0001 \
+	 --maf 0.05 \
+	 --recode \
+	 --out $OUTPREF
+
+done
+
+# extract pruned variants for each population
+for POP in ${POPS[@]};
+do
+
+    PEDSUF="5M.imputed.dose.noambig.ldprune.hwe"
+    POPDIR=${GENDIR}/${POP}
+
+    # make sure ids are unique
+    uniq ${POPDIR}/${POP}.${PEDSUF}.prune.in > ${POPDIR}/${POP}.${PEDSUF}.uniq.prune.in
+
+    bsub -o ${LOGDIR}/${POP}_extract_ped.log \
+	 -e ${ERRDIR}/${POP}_extract_ped.err \
+	 plink --file ${POPDIR}/${POP}.${PEDSUF} \
+	 --extract ${POPDIR}/${POP}.${PEDSUF}.uniq.prune.in \
+	 --recode \
+	 --out ${POPDIR}/${POP}.${PEDSUF}.extract
+
+done
+#+end_src
+
+I'll also do the same on all samples at once for PCA
+
+#+BEGIN_SRC sh
+
+VCF=${GENDIR}/5M.imputed.dose.biallelic.vcf.gz
+OUT=${GENDIR}/5M.imputed.dose.noambig
+
+bsub -o ${LOGDIR}/5M_vcf2ped.log \
+     -e ${ERRDIR}/5M_vcf2ped.err \
+     bash vcf2ped.sh $VCF $OUT
+
+
+# filter PED file for each population
+INPREF=${GENDIR}/5M.imputed.dose.noambig
+OUTPREF=${GENDIR}/5M.imputed.dose.noambig.ldprune.hwe
+
+bsub -o ${LOGDIR}/5M_filter_ped.log \
+     -e ${ERRDIR}/5M_filter_ped.err \
+     plink --file $INPREF \
+     --indep-pairwise 200 100 0.2 \
+     --hwe 0.0001 \
+     --maf 0.05 \
+     --recode \
+     --out $OUTPREF
+
+
+# extract pruned variants for each population
+PEDSUF="5M.imputed.dose.noambig.ldprune.hwe"
+
+# make sure ids are unique
+uniq ${GENDIR}/${PEDSUF}.prune.in > ${GENDIR}/${PEDSUF}.uniq.prune.in
+
+bsub -o ${LOGDIR}/5M_extract_ped.log \
+     -e ${ERRDIR}/5M_extract_ped.err \
+     plink --file ${GENDIR}/${PEDSUF} \
+     --extract ${GENDIR}/${PEDSUF}.uniq.prune.in \
+     --recode \
+     --out ${GENDIR}/${PEDSUF}.extract
+
+#+END_SRC
+
+Next I need to run PCA using eigenstrat on each of these files.
+
+#+begin_src sh
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+for POP in ${POPS[@]};
+do
+
+    PEDSUF="5M.imputed.dose.noambig.ldprune.hwe.extract"
+
+    POPDIR=${GENDIR}/${POP}
+
+    # create files for eigenstrat
+    cut -d' ' -f1-6 ${POPDIR}/${POP}.${PEDSUF}.ped \
+	> ${POPDIR}/${POP}.${PEDSUF}.pedind      
+
+    cp ${POPDIR}/${POP}.${PEDSUF}.map ${POPDIR}/${POP}.${PEDSUF}.pedsnp      
+
+    # creeate parameter file for smartpca
+    PARAMS=${POPDIR}/${POP}_eigenstrat.par
+
+    echo "genotypename: ${POPDIR}/${POP}.${PEDSUF}.ped
+snpname: ${POPDIR}/${POP}.${PEDSUF}.map
+indivname: ${POPDIR}/${POP}.${PEDSUF}.ped
+evecoutname: ${POPDIR}/${POP}.${PEDSUF}.evec
+evaloutname: ${POPDIR}/${POP}.${PEDSUF}.eval
+numoutlieriter: 0" > $PARAMS
+
+    bsub -o ${LOGDIR}/${POP}_eigenstrat.log \
+	 -e ${ERRDIR}/${POP}_eigenstrat.err \
+	 ~/bin/EIG-6.1.4/bin/smartpca -p $PARAMS
+
+done
+#+end_src
+
+And PCA for all individuals at once
+
+#+BEGIN_SRC sh
+
+PEDSUF="5M.imputed.dose.noambig.ldprune.hwe.extract"
+
+# create files for eigenstrat
+cut -d' ' -f1-6 ${GENDIR}/${PEDSUF}.ped \
+> ${GENDIR}/${PEDSUF}.pedind      
+
+cp ${GENDIR}/${PEDSUF}.map ${GENDIR}/${PEDSUF}.pedsnp      
+
+# creeate parameter file for smartpca
+PARAMS=${GENDIR}/5M_eigenstrat.par
+
+echo "genotypename: ${GENDIR}/${PEDSUF}.ped
+snpname: ${GENDIR}/${PEDSUF}.map
+indivname: ${GENDIR}/${PEDSUF}.ped
+evecoutname: ${GENDIR}/${PEDSUF}.evec
+evaloutname: ${GENDIR}/${PEDSUF}.eval
+numoutlieriter: 0" > $PARAMS
+
+bsub -o ${LOGDIR}/Sample_ALL_eigenstrat.log \
+-e ${ERRDIR}/Sample_ALL_eigenstrat.err \
+~/bin/EIG-6.1.4/bin/smartpca -p $PARAMS
+
+#+END_SRC
+
+*** PEER factors
+
+I am going to calculate PEER factors on each population
+
+#+begin_src shell
+module load R-3.2.2
+
+for POP in ${POPS[@]};
+do
+
+  INFILE=${SAMPDIR}/Sample_ALL/Sample_ALL.secondpass.rsem.genes.results.tpm
+  POPFILE=${MISCDIR}/pops/in5M/${POP}.txt
+  OUTDIR=${RASQDIR}/${POP}
+
+  mkdir -p $OUTDIR
+  
+  bsub -o ${LOGDIR}/${POP}_peer.log \
+    -e ${ERRDIR}/${POP}_peer.err \
+    Rscript run_peer.R \
+    $INFILE \
+    $POPFILE \
+    0.1 2 10 \
+    ${OUTDIR}/${POP}.secondpass.gene.norm.tpm.10.txt
+
+done
+#+end_src
+
+As well as all samples combined
+
+#+BEGIN_SRC 
+module load R-3.2.2
+
+  INFILE=${SAMPDIR}/Sample_ALL/Sample_ALL.secondpass.rsem.genes.results.tpm
+  POPFILE=${MISCDIR}/samps.txt
+  OUTDIR=${RASQDIR}
+
+  mkdir -p $OUTDIR
+  
+  bsub -o ${LOGDIR}/${POP}_peer.log \
+    -e ${ERRDIR}/${POP}_peer.err \
+    Rscript run_peer.R \
+    $INFILE \
+    $POPFILE \
+    0.1 2 10 \
+    ${OUTDIR}/Sample_ALL.secondpass.gene.norm.tpm.10.txt
+
+#+END_SRC
+
+*** offsets and GC content
+
+**** get GC content
+Use the get_gc.sh script, piping the contents of the
+Sample_ALL.secondpass.featurecounts.txt file. I'll use the
+Sample_ETAG001 featurecount file since they all have the first
+handfull of columns:
+
+#+begin_src 
+tail -n +3 ${SAMPDIR}/Sample_ETAG001/Sample_ETAG001.secondpass.featurecounts.txt | \
+bash get_gc.sh
+#+end_src
+
+Use the makeOffset.R file for each population. First I need the
+complete count table for all genes for each population:
+
+#+BEGIN_SRC 
+
+#+END_SRC
+
+** make_offset.R
+
+#+begin_src shell
+module load R-3.2.2
+
+for POP in ${POPS[@]};
+do
+
+  OUTDIR=${RASQDIR}/${POP}
+
+  bsub -o ${LOGDIR}/${POP}.make_offset.log \
+    -e ${ERRDIR}/${POP}.make_offset.err \
+    Rscript make_offset.R $POP $OUTDIR
+
+done
+#+end_src
+
+As well as for all samples combined
+
+#+BEGIN_SRC 
+
+module load R-3.2.2
+
+  OUTDIR=${RASQDIR}
+
+  bsub -o ${LOGDIR}/Sample_ALL.make_offset.log \
+    -e ${ERRDIR}/Sample_ALL.make_offset.err \
+    Rscript make_offset.R $POP $OUTDIR
+
+
+#+END_SRC
+
+**** make_covariates.R
+
+#+begin_src shell
+module load R-3.2.2
+
+for POP in ${POPS[@]};
+do
+
+  OUTDIR=${RASQDIR}/${POP}
+
+  bsub -o ${LOGDIR}/${POP}.make_covariates.log \
+    -e ${ERRDIR}/${POP}.make_covariates.err \
+    Rscript make_covariates.R $POP $OUTDIR
+
+done
+#+end_src
+
+And for all populations combined
+
+#+BEGIN_SRC 
+module load R-3.2.2
+
+  OUTDIR=${RASQDIR}
+
+  bsub -o ${LOGDIR}/Sample_ALL.make_covariates.log \
+    -e ${ERRDIR}/Sample_ALL.make_covariates.err \
+    Rscript make_covariates.R $POP $OUTDIR
+
+#+END_SRC
+
+**** convert to binary files
+
+#+begin_src 
+for POP in ${POPS[@]};
+do
+
+  POPDIR=${RASQDIR}/${POP}
+  Y=${POPDIR}/${POP}.Y.txt
+  K=${POPDIR}/${POP}.K.gc_correct.txt
+  X=${POPDIR}/${POP}.X.txt
+
+    R --vanilla --quiet --args $Y $K $X < ~/bin/rasqual/R/txt2bin.R > make_bin.log
+done
+
+#+end_src
+** merge VCF and allelic counts
+
+*** extract posits file
+
+First I need to make sure that all positions are in the relevant file,
+including those with no reads overlapping them. To do this I'm first
+going to generate position files for easy processing.
+
+#+begin_src sh
+for POP in ${POPS[@]};
+do
+
+VCF=${GENDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.vcf.gz
+OUT=${GENDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.posits.vcf.gz
+
+bsub bash extract_posits.sh $VCF $OUT
+
+done
+#+end_src
+
+*** expand allelecount files to include those with 0 reads
+
+#+begin_src 
+for POP in ${POPS[@]};
+do
+
+readarray -t SAMPS<${MISCDIR}/pops/in5M/${POP}.txt
+
+# set up important directories
+ASEDIR=${RASQDIR}/${POP}/allelecounter_out
+
+mkdir -p $ASEDIR
+
+for SAMPLE in ${SAMPS[@]};
+do
+
+TXTIN=${SAMPDIR}/Sample_${SAMPLE}/${SAMPLE}.5M.imputed.dose.biallelic.recode.allelecount.txt
+POSITS=${GENDIR}/5M.imputed.dose.biallelic.recode.posits.vcf.gz
+TXTOUT=${ASEDIR}/${SAMPLE}_ASEReadCounter.merge.txt.gz
+
+# convert TXT to VCF to TXT
+bsub bash allelecount_allposits.sh \
+$TXTIN $POSITS $TXTOUT
+
+done
+done
+#+end_src
+
+Also for the all individuals at once
+
+#+BEGIN_SRC 
+
+# set up important directories
+ASEDIR=${RASQDIR}/allelecounter_out
+
+mkdir -p $ASEDIR
+
+for SAMPLE in ${SAMPS[@]};
+do
+
+TXTIN=${SAMPDIR}/Sample_${SAMPLE}/${SAMPLE}.5M.imputed.dose.biallelic.allelecount.txt
+POSITS=${GENDIR}/5M.imputed.dose.biallelic.maf05.posits.vcf.gz
+TXTOUT=${ASEDIR}/${SAMPLE}_ASEReadCounter.merge.txt.gz
+
+# convert TXT to VCF to TXT
+bsub bash allelecount_allposits.sh \
+$TXTIN $POSITS $TXTOUT
+
+done
+
+#+END_SRC
+
+*** merge all allelecounter files
+
+Merge all allelecounter files
+
+#+begin_src shell
+for POP in ${POPS[@]};
+do
+
+  readarray -t SAMPS<${MISCDIR}/pops/in5M/${POP}.txt
+  POPDIR=${RASQDIR}/${POP}/allelecounter_out
+
+  MERGE_SH=${POPDIR}/${POP}_merge_allelecounter.sh
+  OUT=${POPDIR}/Sample_ALL_ASEReadCounter.merge.txt
+
+  echo "paste <( zcat ${POPDIR}/${SAMPS[0]}_ASEReadCounter.merge.txt.gz | cut -f1-3 ) \\" > $MERGE_SH
+  echo -e "posit\tref\talt\t${SAMPS[@]}" > $OUT
+  sed -i 's/ /\t/g' $OUT
+  
+  for SAMPLE in ${SAMPS[@]};
+  do
+  
+    echo "<( zcat ${POPDIR}/${SAMPLE}_ASEReadCounter.merge.txt.gz | cut -f4 ) \\" >> $MERGE_SH
+
+  done
+    
+  echo ">> ${OUT}" >> $MERGE_SH
+  echo "bgzip -f ${OUT}" >> $MERGE_SH
+  
+  bsub -o ${LOGDIR}/${POP}_merge_allelecount.log \
+    -e ${ERRDIR}/${POP}_merge_allelecount.err \
+    bash $MERGE_SH
+
+done
+#+end_src
+
+And for the combined population analysis
+
+#+BEGIN_SRC 
+
+  readarray -t SAMPS<${MISCDIR}/samps.txt
+  ASEDIR=${RASQDIR}/allelecounter_out
+
+  MERGE_SH=${ASEDIR}/Sample_ALL_merge_allelecounter.sh
+  OUT=${ASEDIR}/Sample_ALL_ASEReadCounter.merge.txt
+
+  echo "paste <( zcat ${ASEDIR}/${SAMPS[0]}_ASEReadCounter.merge.txt.gz | cut -f1-3 ) \\" > $MERGE_SH
+  echo -e "posit\tref\talt\t${SAMPS[@]}" > $OUT
+  sed -i 's/ /\t/g' $OUT
+  
+  for SAMPLE in ${SAMPS[@]};
+  do
+  
+    echo "<( zcat ${ASEDIR}/${SAMPLE}_ASEReadCounter.merge.txt.gz | cut -f4 ) \\" >> $MERGE_SH
+
+  done
+    
+  echo ">> ${OUT}" >> $MERGE_SH
+  echo "bgzip -f ${OUT}" >> $MERGE_SH
+  
+  bsub -o ${LOGDIR}/Sample_ALL_merge_allelecount.log \
+    -e ${ERRDIR}/Sample_ALL_merge_allelecount.err \
+    bash $MERGE_SH
+
+#+END_SRC
+
+*** merge VCF and merged allelecounter files
+
+#+begin_src 
+# set useful directories
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+for POP in ${POPS[@]};
+do
+
+# useful directories for the current population
+POPDIR=${RASQDIR}/${POP}
+ASEDIR=${RASQDIR}/${POP}/allelecounter_out
+
+# get number of samples in population
+NUMSAMP=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d" " -f1)
+
+# vcf file to merge
+VCF=${GENDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.vcf.gz
+    
+# txt file to merge
+TXT=${ASEDIR}/Sample_ALL_ASEReadCounter.merge.txt.gz
+
+# get header information
+HEAD=$(zcat $VCF | head -n 100 | grep "#")
+HEADLEN=$(echo "$HEAD" | wc -l)
+SKIP=$(($HEADLEN + 1))
+
+# output file
+VCFTXT=${POPDIR}/${POP}.5M.imputed.dose.biallelic.recode.allelecount.vcf
+
+# add header
+echo "$HEAD" > $VCFTXT
+
+# paste file
+PASTE=${ASEDIR}/paste_${POP}_vcf_allelecount.sh
+
+echo "paste <(zcat $VCF | tail -n +${SKIP}) <(zcat $TXT | cut -f4- | tail -n +2) | \\
+awk '{ print \$1 \"\t\" \$2 \"\t\" \$3 \"\t\" \$4 \"\t\" \$5 \"\t\" \$6 \"\t\" \$7 \"\t\" \$8 \"\t\" \$9 \":AS\" \\" > $PASTE
+
+for i in $(seq 10 $(($NUMSAMP + 9)));
+do
+VCFIDX=$i
+TXTIDX=$(($i + $NUMSAMP))
+echo "\"\t\"\$${VCFIDX}\":\"\$${TXTIDX} \\" >> $PASTE
+done
+
+echo "}' >> $VCFTXT" >> $PASTE
+echo "bgzip -f $VCFTXT" >> $PASTE
+echo "tabix -f -p vcf ${VCFTXT}.gz" >> $PASTE
+
+bsub -e ${ERRDIR}/${POP}_merge_vcf_allelecount.err \
+-o ${LOGDIR}/${POP}_merge_vcf_allelecount.log \
+bash $PASTE
+
+done
+#+end_src
+
+And again for the combined analysis
+
+#+BEGIN_SRC 
+# set useful directories
+ASEDIR=${RASQDIR}/allelecounter_out
+
+# get number of samples in population
+NUMSAMP=$(wc -l ${MISCDIR}/samps.txt | cut -d" " -f1)
+
+# vcf file to merge
+VCF=${GENDIR}/5M.imputed.dose.biallelic.maf05.vcf.gz
+    
+# txt file to merge
+TXT=${ASEDIR}/Sample_ALL_ASEReadCounter.merge.txt.gz
+
+# get header information
+HEAD=$(zcat $VCF | head -n 100 | grep "#")
+HEADLEN=$(echo "$HEAD" | wc -l)
+SKIP=$(($HEADLEN + 1))
+
+# output file
+VCFTXT=${ASEDIR}/5M.imputed.dose.biallelic.maf05.allelecount.vcf
+
+# add header
+echo "$HEAD" > $VCFTXT
+
+# paste file
+PASTE=${ASEDIR}/paste_ALL_vcf_allelecount.sh
+
+echo "paste <(zcat $VCF | tail -n +${SKIP}) <(zcat $TXT | cut -f4- | tail -n +2) | \\
+awk '{ print \$1 \"\t\" \$2 \"\t\" \$3 \"\t\" \$4 \"\t\" \$5 \"\t\" \$6 \"\t\" \$7 \"\t\" \$8 \"\t\" \$9 \":AS\" \\" > $PASTE
+
+for i in $(seq 10 $(($NUMSAMP + 9)));
+do
+VCFIDX=$i
+TXTIDX=$(($i + $NUMSAMP))
+echo "\"\t\"\$${VCFIDX}\":\"\$${TXTIDX} \\" >> $PASTE
+done
+
+echo "}' >> $VCFTXT" >> $PASTE
+echo "bgzip -f $VCFTXT" >> $PASTE
+echo "tabix -f -p vcf ${VCFTXT}.gz" >> $PASTE
+
+bsub -e ${ERRDIR}/${POP}_merge_vcf_allelecount.err \
+-o ${LOGDIR}/${POP}_merge_vcf_allelecount.log \
+bash $PASTE
+
+#+END_SRC
+
+<2020-03-09 Mon>
+
+I've run into a major error. I only quantified allele-specific read
+counts for heterozygotes! I'm going to use their
+./createASVCF.sh. Even if it's slow it should work.
+
+#+BEGIN_SRC sh
+
+WORKDIR=$RASQDIR/peer0to5
+WORKMISC=$WORKDIR/misc
+
+mkdir -p $WORKMISC
+
+for POP in ${POPS[@]};
+do
+
+SAMPFILE=$MISCDIR/pops/in5M/$POP.txt
+BAMLIST=$WORKMISC/${POP}_bam_list.txt
+INVCF=$GENDIR/$POP/$POP.5M.imputed.dose.biallelic.recode.vcf.gz
+OUTVCF=$WORKDIR/geno/$POP.5M.imputed.dose.biallelic.recode.asreads.vcf.gz
+
+# make bam_list_file
+awk -v sampdir="$SAMPDIR" '{ print sampdir "/Sample_" $0 "/Sample_" $0 ".secondpassAligned.out.255.sort.rg.bam" }' $SAMPFILE > $BAMLIST
+
+bsub -o $LOGDIR/createASVCF.$POP.log \
+-e $ERRDIR/createASVCF.$POP.err \
+bash ~/bin/rasqual/src/ASVCF/createASVCF.sh \
+paired_end $BAMLIST $INVCF $OUTVCF rna
+
+done
+
+
+#+END_SRC
+
+** run RASQUAL
+
+*** get feature file
+
+Used to iterate over while calling RASQUAL.
+
+#+begin_src 
+for POP in ${POPS[@]};
+do
+
+  readarray -t SAMPS<${MISCDIR}/pops/in5M/${POP}.txt
+
+  join -j 1 <( tail -n +3 ${SAMPDIR}/Sample_${SAMPS[0]}/Sample_${SAMPS[0]}.secondpass.featurecounts.txt | sort -k1,1 ) \
+    <( sort -k1,1 ${RASQDIR}/${POP}/${POP}.Y.txt ) -t $'\t' | \
+    cut -f1-5 | sed 's/chr//g' > ${RASQDIR}/${POP}/${POP}.features.txt
+
+done
+#+end_src
+
+07/14/19 I have filtered the gene expression data: There must be more
+than 5 reads in at least 20 individuals and the gene must have a mean
+greater than 0.1 across all populations.
+
+#+BEGIN_SRC 
+
+
+join -j 1 <( tail -n +3 ${SAMPDIR}/Sample_ETAG001/Sample_ETAG001.secondpass.featurecounts.txt | sort -k1,1 ) \
+<( sort -k1,1 ${RASQDIR}/peer0to5/gex/agaw.Y.txt ) -t $'\t' | \
+cut -f1-5 | sed 's/chr//g' > ${RASQDIR}/peer0to5/features/features.gt5reads20.mtpm01.txt
+
+
+#+END_SRC
+
+*** run rasqual
+
+#+begin_src shell
+
+bgadd /derkelly_rasqual
+
+readarray -t POPS<${MISCDIR}/all_pops.no_weyto.txt
+
+for POP in ${POPS[@]};
+do
+
+FEATURES=${RASQDIR}/${POP}/${POP}.features.txt
+VCF=${RASQDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.allelecount.vcf.gz
+OUTDIR=${RASQDIR}/${POP}/rasqual_out/100kb
+
+mkdir -p $OUTDIR
+MYTMPDIR=${TEMPDIR}/test_rasqual
+mkdir -p $MYTMPDIR
+
+N=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d' ' -f1)
+
+NFEATS=$(wc -l $FEATURES | cut -d' ' -f1)
+
+NJOBS=1000
+NCHUNK=$((NFEATS / NJOBS))
+
+for CHUNK in $(seq 1 $NCHUNK);
+do
+
+IDX_START=$(( (${CHUNK} - 1) * 1000 +1 ))
+IDX_STOP=$(( (${CHUNK})*1000 ))
+
+bsub -o ${LOGDIR}/${POP}_rasqual.100kb.log \
+  -e ${ERRDIR}/${POP}_rasqual.100kb.err \
+  -g /derkelly_rasqual \
+  -J "${POP}_rasqual[$IDX_START-$IDX_STOP]" \
+  bash rasqual_call.sh $FEATURES \
+  $VCF \
+  ${RASQDIR}/${POP}/${POP}.Y.bin \
+  ${RASQDIR}/${POP}/${POP}.K.gc_correct.bin \
+  ${RASQDIR}/${POP}/${POP}.X.bin \
+  $N \
+  100000 \
+  $MYTMPDIR \
+  $OUTDIR
+
+done
+done
+#+end_src
+
+Also run RASQUAL for all individuals at once.
+
+#+BEGIN_SRC 
+FEATURES=${RASQDIR}/Sample_ALL.features.txt
+VCF=${RASQDIR}/allelecounter_out/5M.imputed.dose.biallelic.maf05.allelecount.vcf.gz
+OUTDIR=${RASQDIR}/rasqual_out/500kb
+
+mkdir -p $OUTDIR
+MYTMPDIR=${TEMPDIR}/test_rasqual
+
+N=$(wc -l ${MISCDIR}/samps.txt | cut -d' ' -f1)
+
+NFEATS=$(wc -l $FEATURES | cut -d' ' -f1)
+
+bgadd /test_rasqual
+
+bsub -o ${LOGDIR}/Sample_ALL_rasqual.test.500kb.log \
+  -e ${ERRDIR}/Sample_ALL_rasqual.test.500kb.err \
+  -g /test_rasqual \
+  -J "test_rasqual[1-$NFEATS]" \
+  bash rasqual_call.sh $FEATURES \
+  $VCF \
+  ${RASQDIR}/Sample_ALL.Y.bin \
+  ${RASQDIR}/Sample_ALL.K.gc_correct.bin \
+  ${RASQDIR}/Sample_ALL.X.bin \
+  $N \
+  500000 \
+  $MYTMPDIR \
+  $OUTDIR
+
+#+END_SRC
+
+Running with RASQUAL hyper-parameter ABPHI = 2
+
+#+begin_src shell
+
+bgadd /derkelly_rasqual
+
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+for POP in ${POPS[@]};
+do
+
+FEATURES=${RASQDIR}/${POP}/${POP}.features.txt
+VCF=${RASQDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.allelecount.vcf.gz
+OUTDIR=${RASQDIR}/${POP}/rasqual_out/100kb_ABPHI_2
+
+mkdir -p $OUTDIR
+MYTMPDIR=${TEMPDIR}/test_rasqual
+mkdir -p $MYTMPDIR
+
+N=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d' ' -f1)
+
+NFEATS=$(wc -l $FEATURES | cut -d' ' -f1)
+
+NJOBS=1000
+NCHUNK=$((NFEATS / NJOBS))
+
+for CHUNK in $(seq 1 $NCHUNK);
+do
+
+IDX_START=$(( (${CHUNK} - 1) * 1000 +1 ))
+IDX_STOP=$(( (${CHUNK})*1000 ))
+
+bsub -o ${LOGDIR}/${POP}_rasqual.100kb.log \
+  -e ${ERRDIR}/${POP}_rasqual.100kb.err \
+  -g /derkelly_rasqual \
+  -J "${POP}_rasqual[$IDX_START-$IDX_STOP]" \
+  bash rasqual_call.abphi2.sh $FEATURES \
+  $VCF \
+  ${RASQDIR}/${POP}/${POP}.Y.bin \
+  ${RASQDIR}/${POP}/${POP}.K.gc_correct.bin \
+  ${RASQDIR}/${POP}/${POP}.X.bin \
+  $N \
+  100000 \
+  $MYTMPDIR \
+  $OUTDIR
+
+done
+done
+#+end_src
+
+Run RASQUAL for 0-5 PEER factors.
+
+#+BEGIN_SRC 
+
+bgadd /derkelly_rasqual
+
+for POP in ${POPS[@]};
+do
+
+FEATURES=${RASQDIR}/${POP}/${POP}.features.txt
+VCF=${RASQDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.allelecount.vcf.gz
+OUTDIR=${RASQDIR}/${POP}/rasqual_out/100kb
+
+mkdir -p $OUTDIR
+MYTMPDIR=${TEMPDIR}/test_rasqual
+mkdir -p $MYTMPDIR
+
+N=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d' ' -f1)
+
+NFEATS=$(wc -l $FEATURES | cut -d' ' -f1)
+
+NJOBS=1000
+NCHUNK=$((NFEATS / NJOBS))
+for CHUNK in $(seq 1 $NCHUNK);
+do
+
+IDX_START=$(( (${CHUNK} - 1) * 1000 +1 ))
+IDX_STOP=$(( (${CHUNK})*1000 ))
+
+bsub -o ${LOGDIR}/${POP}_rasqual.100kb.log \
+  -e ${ERRDIR}/${POP}_rasqual.100kb.err \
+  -g /derkelly_rasqual \
+  -J "${POP}_rasqual[$IDX_START-$IDX_STOP]" \
+  bash rasqual_call.w_abphi.loop.sh $FEATURES \
+  $VCF \
+  ${RASQDIR}/${POP}/${POP}.Y.bin \
+  ${RASQDIR}/${POP}/${POP}.K.gc_correct.bin \
+  ${RASQDIR}/${POP}/${POP}.X.bin \
+  $N \
+  2 \
+  100000 \
+  $MYTMPDIR \
+  $OUTDIR
+
+done
+done
+
+#+END_SRC
+
+*** run null rasqual
+
+#+begin_src shell
+bgadd /derkelly_rasqual_null
+
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+for POP in ${POPS[@]};
+do
+
+FEATURES=${RASQDIR}/${POP}/${POP}.features.txt
+VCF=${RASQDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.allelecount.vcf.gz
+OUTDIR=${RASQDIR}/${POP}/rasqual_out/100kb_null
+
+mkdir -p $OUTDIR
+MYTMPDIR=${TEMPDIR}/test_rasqual
+mkdir -p $MYTMPDIR
+
+N=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d' ' -f1)
+
+NFEATS=$(wc -l $FEATURES | cut -d' ' -f1)
+
+NJOBS=1000
+NCHUNK=$((NFEATS / NJOBS))
+
+for CHUNK in $(seq 1 $NCHUNK);
+do
+
+IDX_START=$(( (${CHUNK} - 1) * 1000 +1 ))
+IDX_STOP=$(( (${CHUNK})*1000 ))
+
+bsub -o ${LOGDIR}/${POP}_rasqual.100kb.null.log \
+  -e ${ERRDIR}/${POP}_rasqual.100kb.null.err \
+  -g /derkelly_rasqual \
+  -J "${POP}_rasqual[$IDX_START-$IDX_STOP]" \
+  bash rasqual_call.sh $FEATURES \
+  $VCF \
+  ${RASQDIR}/${POP}/${POP}.Y.bin \
+  ${RASQDIR}/${POP}/${POP}.K.gc_correct.bin \
+  ${RASQDIR}/${POP}/${POP}.X.bin \
+  $N \
+  100000 \
+  $MYTMPDIR \
+  $OUTDIR
+
+done
+done
+#+end_src
+
+** combine and tabix-ify RASQUAL output
+
+#+BEGIN_SRC 
+
+for POP in ${POPS[@]};
+do
+
+RASQPOP=${RASQDIR}/${POP}
+OUT=${RASQPOP}/${POP}.rasqual.out.txt.gz
+
+bsub -o ${LOGDIR}/${POP}.concat_rasqual.log \
+-e ${ERRDIR}/${POP}.concat_rasqual.err \
+bash concat_rasqual_out.sh \
+${RASQPOP}/rasqual_out/100kb \
+${OUT}
+
+done
+
+
+#+END_SRC
+
+Do the same for the results re-run with -ABPHI 2
+
+#+BEGIN_SRC 
+
+for POP in ${POPS[@]};
+do
+
+RASQPOP=${RASQDIR}/${POP}
+OUT=${RASQPOP}/${POP}.rasqual.abphi2.out.txt.gz
+
+bsub -o ${LOGDIR}/${POP}.concat_rasqual.log \
+-e ${ERRDIR}/${POP}.concat_rasqual.err \
+bash concat_rasqual_out.sh \
+${RASQPOP}/rasqual_out/100kb_ABPHI_2 \
+${OUT}
+
+done
+
+
+#+END_SRC
+
+
+* FastQTL
+
+** quantile normalize TPM
+
+#+BEGIN_SRC 
+
+GEX=${SAMPDIR}/Sample_ALL/Sample_ALL.secondpass.rsem.genes.results.tpm
+SAMPFILE=${MISCDIR}/samps.txt
+OUT=${FASTDIR}/Sample_ALL.secondpass.rsem.genes.results.tpm.quantnorm.txt
+
+bsub -o ${LOGDIR}/fastql_quantnorm.log \
+-e ${ERRDIR}/fastql_quantnorm.err \
+Rscript quantile_normalize.R \
+$GEX $SAMPFILE $OUT
+
+## now add the TSS information
+TSS=${MISCDIR}/gencode.v19.TSS.txt
+OUTOUT=${FASTDIR}/Sample_ALL.secondpass.rsem.genes.results.tpm.quantnorm.bed
+
+head -n 1 $OUT | awk '{ print "#Chr\tstart\tend\tID\t" substr($0, index($0,$2)) }' > $OUTOUT
+
+join -j 1 <( sort -k1,1 $TSS ) \
+    <( sort -k1,1 $OUT ) -t $'\t' | \
+    awk '{ print $2 "\t" $3-1 "\t" $3 "\t" $1 "\t" substr($0, index($0,$4)) }' >> $OUTOUT
+
+#+END_SRC
+
+Next generate covariate file:
+
+#+BEGIN_SRC 
+Rscript make_covariates.fastqtl.R
+#+END_SRC
+
+I had to add "id" in the first column after.
+
+** quantile normalize TPM per population
+   
+Next generate covariate file:
+
+#+BEGIN_SRC 
+
+for POP in ${POPS[@]};
+do
+
+POPDIR=$FASTDIR/$POP
+mkdir -p $POPDIR
+
+SAMPFILE=$MISCDIR/pops/in5M/$POP.txt
+readarray -t POPSAMPS<$SAMPFILE
+
+## Let's make TPM files for each POP
+POPTPM=$POPDIR/$POP.secondpass.rsem.genes.results.tpm
+TPMSH=$POPDIR/generate_tpm.sh
+
+## add header
+paste <( head -n1 $SAMPDIR/Sample_${POPSAMPS[0]}/Sample_${POPSAMPS[0]}.secondpass.rsem.genes.results | cut -f1,2 ) \
+<( echo "${POPSAMPS[@]}" | sed 's/ /\t/g' ) > $POPTPM
+
+## make shell file
+echo "paste <( tail -n +2 $SAMPDIR/Sample_${POPSAMPS[0]}/Sample_${POPSAMPS[0]}.secondpass.rsem.genes.results | cut -f1,2,6 ) \\" > $TPMSH
+for SAMP in ${POPSAMPS[@]:1};
+do
+
+echo "<( tail -n +2 $SAMPDIR/Sample_$SAMP/Sample_$SAMP.secondpass.rsem.genes.results | cut -f6 ) \\" >> $TPMSH
+
+done
+echo ">> $POPTPM" >> $TPMSH
+
+## generate TPM
+bash $TPMSH
+
+## normalize TPM
+TPMNORM=${FASTDIR}/${POP}/${POP}.secondpass.rsem.genes.results.tpm.quantnorm.txt
+
+bsub -o ${LOGDIR}/fastql_quantnorm.log \
+-e ${ERRDIR}/fastql_quantnorm.err \
+Rscript quantile_normalize.R \
+$POPTPM $SAMPFILE $TPMNORM
+
+done
+
+
+## now add the TSS information
+for POP in ${POPS[@]};
+do
+
+IN=${FASTDIR}/${POP}/${POP}.secondpass.rsem.genes.results.tpm.quantnorm.txt
+TSS=${MISCDIR}/gencode.v19.TSS.txt
+OUT=${FASTDIR}/${POP}/${POP}.secondpass.rsem.genes.results.tpm.quantnorm.bed
+
+head -n 1 $IN | awk '{ print "#Chr\tstart\tend\tID\t" substr($0, index($0,$2)) }' > $OUT
+
+join -j 1 <( sort -k1,1 $TSS ) \
+    <( sort -k1,1 $IN ) -t $'\t' | \
+    awk '{ print $2 "\t" $3-1 "\t" $3 "\t" $1 "\t" substr($0, index($0,$4)) }' | \
+    sed 's/chr//g' | \
+    sort -k1,1 -k2,2n >> $OUT
+
+bgzip -f $OUT
+
+done
+
+#+END_SRC
+
+#+BEGIN_SRC 
+for POP in ${POPS[@]};
+do
+
+Rscript make_covariates.fastqtl.pop.R $POP
+
+done
+#+END_SRC
+
+** run FastQTL
+
+Permutation based analysis
+
+#+BEGIN_SRC 
+BED=${FASTDIR}/Sample_ALL.secondpass.rsem.genes.results.tpm.quantnorm.bed.gz
+COVAR=${FASTDIR}/Sample_ALL.fastqtl.covars.txt
+VCF=${GENDIR}/5M.imputed.dose.biallelic.maf05.vcf.gz
+COMMANDS=${FASTDIR}/Sample_ALL.fastqtl.permute.commands.50.txt
+OUTDIR=${FASTDIR}/permute_out
+
+mkdir -p $OUTDIR
+
+# split into 100 commands to run in parallel
+~/bin/FastQTL/bin/fastQTL.static \
+--vcf $VCF \
+--bed $BED \
+--cov $COVAR \
+--permute 1000 10000 \
+--seed 4690 \
+--out ${OUTDIR}/Sample_ALL.fastqtl.permute \
+--commands 50 $COMMANDS
+
+# run on cluster with adaptive permutation
+while read c; do
+     echo $c | bsub
+done < $COMMANDS
+#+END_SRC
+
+Nominal eQTL mapping
+
+#+BEGIN_SRC 
+
+BED=${FASTDIR}/Sample_ALL.secondpass.rsem.genes.results.tpm.quantnorm.bed.gz
+COVAR=${FASTDIR}/Sample_ALL.fastqtl.covars.txt
+VCF=${GENDIR}/5M.imputed.dose.biallelic.maf05.vcf.gz
+COMMANDS=${FASTDIR}/Sample_ALL.fastqtl.nominal.commands.50.txt
+OUTDIR=${FASTDIR}/nominal_out
+
+mkdir -p $OUTDIR
+
+# split into 100 commands to run in parallel
+~/bin/FastQTL/bin/fastQTL.static \
+--vcf $VCF \
+--bed $BED \
+--cov $COVAR \
+--seed 4690 \
+--out ${OUTDIR}/Sample_ALL.fastqtl.nominal \
+--commands 50 $COMMANDS
+
+# run on cluster
+while read c; do
+     echo $c | bsub
+done < $COMMANDS
+
+#+END_SRC
+
+** run FastQTL per population
+
+
+Permutation based analysis
+
+This is having problems (04/05/19)
+
+#+BEGIN_SRC 
+
+for POP in ${POPS[@]};
+do
+
+BED=${FASTDIR}/${POP}/${POP}.secondpass.rsem.genes.results.tpm.quantnorm.bed.gz
+COVAR=${FASTDIR}/${POP}/${POP}.fastqtl.covars.txt
+VCF=${GENDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.vcf.gz
+COMMANDS=${FASTDIR}/${POP}/${POP}.fastqtl.permute.commands.50.txt
+OUTDIR=${FASTDIR}/${POP}/permute_out
+
+mkdir -p $OUTDIR
+
+# split into 50 commands to run in parallel
+~/bin/FastQTL/bin/fastQTL.static \
+--vcf $VCF \
+--bed $BED \
+--cov $COVAR \
+--permute 1000 10000 \
+--seed 4690 \
+--out ${OUTDIR}/${POP}.fastqtl.permute \
+--commands 50 $COMMANDS
+
+# run on cluster with adaptive permutation
+while read c; do
+     echo $c | bsub
+done < $COMMANDS
+
+done
+#+END_SRC
+
+Nominal eQTL mapping
+
+#+BEGIN_SRC 
+
+for POP in ${POPS[@]};
+do
+
+BED=${FASTDIR}/${POP}/${POP}.secondpass.rsem.genes.results.tpm.quantnorm.bed.gz
+COVAR=${FASTDIR}/${POP}/${POP}.fastqtl.covars.txt
+VCF=${GENDIR}/${POP}/${POP}.5M.imputed.dose.biallelic.recode.vcf.gz
+COMMANDS=${FASTDIR}/${POP}/${POP}.fastqtl.nominal.commands.50.txt
+OUTDIR=${FASTDIR}/${POP}/nominal_out
+
+mkdir -p $OUTDIR
+
+# split into 100 commands to run in parallel
+~/bin/FastQTL/bin/fastQTL.static \
+--vcf $VCF \
+--bed $BED \
+--cov $COVAR \
+--seed 4690 \
+--out ${OUTDIR}/${POP}.fastqtl.nominal \
+--commands 50 $COMMANDS
+
+done
+
+# run on cluster
+while read c; do
+     echo $c | bsub
+done < $COMMANDS
+
+#+END_SRC
+
+
+* Filter RASQUAL results
+
+Casey suggests keeping variants with allele bias between 0.25-0.75,
+sequence mapping error (error delta) less than 0.1, and corr fSNP >
+0.9.
+
+#+BEGIN_SRC 
+
+for POP in ${POPS[@]};
+do
+
+IN=${RASQDIR}/${POP}/${POP}.rasqual.out.txt.gz
+OUT=${RASQDIR}/${POP}/${POP}.rasqual.out.filt.txt.gz
+
+bsub -o ${LOGDIR}/${POP}_filt_rasqual.log \
+-e ${ERRDIR}/${POP}_filt_rasqual.err \
+bash filt_rasqual.sh $IN $OUT
+
+done
+
+#+END_SRC
+
+Do the same for the -ABPHI 2 results
+
+#+BEGIN_SRC 
+
+for POP in ${POPS[@]};
+do
+
+IN=${RASQDIR}/${POP}/${POP}.rasqual.abphi2.out.txt.gz
+OUT=${RASQDIR}/${POP}/${POP}.rasqual.abphi2.out.filt.txt.gz
+
+bsub -o ${LOGDIR}/${POP}_filt_rasqual.log \
+-e ${ERRDIR}/${POP}_filt_rasqual.err \
+bash filt_rasqual.sh $IN $OUT
+
+done
+
+#+END_SRC
+
+I've re-done RASQUAL mapping for 0-5 PEER factors; I need to filter
+the results and concatenate
+
+#+BEGIN_SRC
+
+
+
+#+END_SRC
+
+# *** Concatenate files, extracting necessary information
+
+# I need the feature ID (gene ID), snp ID, ref allele, alternative
+# allele, chi-square statistic, and effect size direction (sign(pi -
+# 0.5))
+
+# #+BEGIN_SRC sh
+# for POP in ${POPS[@]};
+# do
+
+# INDIR=${RASQDIR}/${POP}/rasqual_out/100kb
+# OUT=${METADIR}/${POP}_rasqual_stats4metal.txt
+
+# N=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d' ' -f1)
+
+# bsub -o ${LOGDIR}/${POP}_extract_stats4metal.log \
+# -e ${ERRDIR}/${POP}_extract_stats4metal.err \
+# bash extract_stats4metal.sh $INDIR $N $OUT
+
+# done
+# #+END_SRC
+
+*** Extract information for METAL
+
+I need the feature ID (gene ID), snp ID, ref allele, alternative
+allele, chi-square statistic, and effect size direction (sign(pi -
+0.5))
+
+#+BEGIN_SRC sh
+
+for POP in ${POPS[@]};
+do
+
+INDIR=${RASQDIR}/${POP}/rasqual_out/100kb
+OUT=${METADIR}/${POP}_rasqual_stats4metal.txt
+
+N=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d' ' -f1)
+
+bsub -o ${LOGDIR}/${POP}_extract_stats4metal.log \
+-e ${ERRDIR}/${POP}_extract_stats4metal.err \
+bash extract_stats4metal.sh $INDIR $N $OUT
+
+done
+
+#+END_SRC
+
+I'm going to do the same with the filtered results
+
+#+BEGIN_SRC 
+
+for POP in ${POPS[@]};
+do
+
+IN=${RASQDIR}/${POP}/${POP}.rasqual.out.filt.txt.gz
+OUT=${METADIR}/filt/${POP}_rasqual_stats4metal.filt.txt
+
+N=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d' ' -f1)
+
+bsub -o ${LOGDIR}/${POP}_extract_stats4metal.log \
+-e ${ERRDIR}/${POP}_extract_stats4metal.err \
+bash extract_stats4metal.filt.sh $IN $N $OUT
+
+done
+
+#+END_SRC
+
+Do the same for -ABPHI 2 results
+
+#+BEGIN_SRC sh
+
+module load R-3.2.2
+
+for POP in ${POPS[@]};
+do
+
+IN=${RASQDIR}/${POP}/${POP}.rasqual.abphi2.out.filt.txt.gz
+OUT=${METADIR}/filt/${POP}_rasqual_stats4metal.abphi2.filt.txt
+
+N=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d' ' -f1)
+
+bsub -o ${LOGDIR}/${POP}_extract_stats4metal.log \
+-e ${ERRDIR}/${POP}_extract_stats4metal.err \
+bash extract_stats4metal.filt.sh $IN $N $OUT
+
+done
+
+#+END_SRC
+
+
+
+<2020-03-16 Mon>
+
+Extract statistics for running with METAL
+
+#+BEGIN_SRC 
+
+module load R-3.2.2
+
+OUTDIR=${RASQDIR}/peer0to5/metal/stats/new_0316/
+mkdir -p $OUTDIR
+
+for POP in ${POPS[@]};
+do
+
+N=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d' ' -f1)
+
+for i in {0..3};
+do
+
+IN=${RASQDIR}/peer0to5/output/concat/new_0310/${POP}.peer$i.rasqual.abphi2.out.txt.gz
+OUT=$OUTDIR/${POP}_peer${i}_rasqual_stats4metal.0316.abphi2.txt
+
+IN_FILT=${RASQDIR}/peer0to5/output/concat/new_0310/${POP}.peer$i.rasqual.abphi2.out.filt.txt.gz
+OUT_FILT=$OUTDIR/${POP}_peer${i}_rasqual_stats4metal.0316.abphi2.filt.txt
+
+bsub -o ${LOGDIR}/${POP}_extract_stats4metal.log \
+-e ${ERRDIR}/${POP}_extract_stats4metal.err \
+bash $PIPEDIR/extract_stats4metal.sh $IN $N $OUT
+
+bsub -o ${LOGDIR}/${POP}_extract_stats4metal.log \
+-e ${ERRDIR}/${POP}_extract_stats4metal.err \
+bash $PIPEDIR/extract_stats4metal.sh $IN_FILT $N $OUT_FILT
+
+done
+
+done
+
+#+END_SRC
+
+*** Perform meta-analysis with METAL
+
+Note that the script has been constructed and is ${METADIR}/metal_script.sh
+
+#+BEGIN_SRC sh
+bsub -o ${LOGDIR}/metal.log \
+-o ${ERRDIR}/metal.err \
+bash ${METADIR}/metal_script.sh
+#+END_SRC
+
+Also perform for filtered data, which must be done interactively (?)
+
+#+BEGIN_SRC sh
+bsub -o ${LOGDIR}/metal.filt.log \
+-e ${ERRDIR}/metal.filt.err \
+bash ${METADIR}/filt/metal_script.filt.sh
+#+END_SRC
+
+Also perform for the -ABPHI 2 results
+
+#+BEGIN_SRC sh
+bsub -o ${LOGDIR}/metal.filt.log \
+-e ${ERRDIR}/metal.filt.err \
+bash ${METADIR}/filt/metal_script.filt.sh
+#+END_SRC
+
+*** Concatenate null files and extract necessary information
+
+I need the feature ID (gene ID), snp ID, ref allele, alternative
+allele, chi-square statistic, and effect size direction (sign(pi -
+0.5)) for the null values as well. Same as above except I want it to
+go into the "null" directory.
+
+#+BEGIN_SRC sh
+for POP in ${POPS[@]};
+do
+
+INDIR=${RASQDIR}/${POP}/rasqual_out/100kb_null
+OUT=${METADIR}/null/${POP}_rasqual_stats4metal_null.txt
+
+N=$(wc -l ${MISCDIR}/pops/in5M/${POP}.txt | cut -d' ' -f1)
+
+bsub -o ${LOGDIR}/${POP}_extract_stats4metal_null.log \
+-e ${ERRDIR}/${POP}_extract_stats4metal_null.err \
+bash extract_stats4metal.sh $INDIR $N $OUT
+
+done
+#+END_SRC
+
+*** Perform meta-analysis for null values
+
+#+BEGIN_SRC sh
+~/bin/generic-metal/metal
+
+SOURCE metal_script_null.txt
+#+END_SRC
+
+
+
+* leafcutter
+
+Ignore WASP filtering for now
+
+** WASP filtering
+
+Leafcutter suggests filtering the .bam files with WASP to remove reads
+that have differential mapping due to allelic bias. To begin, VCF
+files must be converted to HDF5 files. I'll use the genotype file that
+has not been filtered by allele frequency and the snp2h5 script
+provided by the WASP pipeline. First, however, I must separate by
+chromosome:
+
+#+BEGIN_SRC 
+
+for i in {1..22};
+do
+tabix -h ${GENDIR}/5M.imputed.dose.biallelic.vcf.gz ${i} | \
+bgzip > ${GENDIR}/by_chr/5M.imputed.dose.biallelic.chr${i}.vcf.gz
+done
+
+CHR=${GENODIR}/chromInfo.nochr.txt.gz
+VCF=${GENDIR}/by_chr/5M.imputed.dose.biallelic.vcf.gz
+HAP=${LEAFDIR}/by_chr/5M.imputed.dose.biallelic.haplotypes.h5
+IDX=${LEAFDIR}/by_chr/5M.imputed.dose.biallelic.snp_index.h5
+TAB=${LEAFDIR}/by_chr/5M.imputed.dose.biallelic.snp_tab.h5
+
+# ~/bin/WASP/snp2h5/snp2h5 --chrom $CHR \
+# --format vcf \
+# --haplotype $HAP \
+# --snp_index $IDX \
+# --snp_tab $TAB \
+# $VCF
+
+bsub -o ${LOGDIR}/snp2h5.log \
+-e ${ERRDIR}/snp2h5.err \
+bash snp2h5.sh $CHR $VCF $HAP $IDX $TAB
+
+#+END_SRC
+
+I next need to generate text-based SNP files. The provided scripts
+assume each chromosome is in a different file.
+
+#+BEGIN_SRC
+
+SNPDIR=${LEAFDIR}/snp_files
+VCF=${GENDIR}/5M.imputed.dose.biallelic.vcf.gz
+SNPPRE=${SNPDIR}/5M.imputed.dose.biallelic
+SNPSUF="snps.txt"
+
+pushd $LEAFDIR
+
+## get position and allele information for all chromosomes
+zcat $VCF | \
+egrep -v "^#" | \
+awk '{ print $2,$4,$5>$1 }'
+
+## for chromosomes 1 through 22, grep for the chromosome and print the contents to individual files
+for i in {1..22};
+do
+OUT=${SNPPRE}.chr${i}.${SNPSUF}
+mv $i $OUT
+bgzip $OUT
+done
+
+#+END_SRC
+
+Use find_intersecting_snps.py to identify reads that may have mapping biases
+
+#+BEGIN_SRC 
+
+TAB=${LEAFDIR}/5M.imputed.dose.biallelic.snp_tab.h5
+IDX=${LEAFDIR}/5M.imputed.dose.biallelic.snp_index.h5
+HAP=${LEAFDIR}/5M.imputed.dose.biallelic.haplotypes.h5
+SAMPFILE=${MISCDIR}/samps.txt
+
+readarray -t SAMPS<${SAMPFILE}
+
+## start virtual python session
+##module add python-3.4.2
+##virtualenv $HOME/my_python-3.4.2  --system-site-packages
+
+for SAMP in ${SAMPS[@]};
+do
+
+BAM=${SAMPDIR}/Sample_${SAMP}/secondpassAligned.out.255.sort.rg.bamx
+OUTDIR=${SAMPDIR}/Sample_${SAMP}/wasp_files
+
+mkdir -p $OUTDIR
+
+bsub -o ${LOGDIR}/${SAMP}.intersecting_snps.log \
+-e ${ERRDIR}/${SAMP}.intersecting_snps.err \
+bash find_intersecting_snps.sh \
+$TAB \
+$IDX \
+$HAP \
+$SAMP \
+$BAM \
+$OUTDIR
+
+done
+
+#+END_SRC
+
+** generate .junc files
+
+First thing is to convert .bam files into .junc files. This needs to
+be done for every sample, so should go into the 'samples' directory.
+
+#+BEGIN_SRC sh
+
+for SAMPLE in ${SAMPLES[@]};
+do
+
+    BAM=${SAMPDIR}/${SAMPLE}/secondpassAligned.out.bam
+    JUNC=${SAMPDIR}/${SAMPLE}/${SAMPLE}.leafcutter.junc
+
+    bsub -o ${LOGDIR}/leafcutter_junc.log \
+	 -e ${ERRDIR}/leafcutter_junc.err \
+	 bash ~/bin/leafcutter/scripts/bam2junc.sh $BAM $JUNC
+
+done
+
+#+END_SRC
+
+** cluster splicing files
+
+Next I need to cluster the splicing files. I'll use default setting,
+which includes a minimum of 50 reads per cluster and a maximum intro
+length of 500kb. This should be run from the leafcutter directory to
+make things easier.
+
+#+BEGIN_SRC 
+
+JUNCS=${LEAFDIR}/juncfiles.txt
+ls ${SAMPDIR}/*/*.leafcutter.junc > $JUNCS
+
+cd $LEAFDIR
+
+bsub -o ${LOGDIR}/leafcutter_cluster.log \
+-e ${ERRDIR}/leafcutter_cluster.err \
+bash ${PIPEDIR}/leafcutter_cluster.sh \
+juncfiles.txt leafcutter_all
+
+#+END_SRC
+
+** filter splicing data
+
+I now need to construct the files for FastQTL. The supplied scripts
+perform PCA as covariates but I'll use 10 PEER factors. I'm basing
+much of my analysis off of https://doi.org/10.1038/s41588-018-0092-1 
+
+Looking at the code provided for leafcutter is looks like each column
+(i.e. each sample) is quantile normalized to the standard normal
+distribution. Because there are an excess of introns with ratios equal
+to 1 I must choose how to break ties. I tried setting ties to the
+minimum and maximum rank value; normalizing per sample and then
+looking at the distribution of splicing fractions across introns shows
+a large number of outliers when breaking ties using the maximum, which
+will likely disrupt any downstream regression. Setting ties to the
+minimum rank gives a much more normal distribution for each intron, so
+I'm going with that. Another option is to set it to the average, but
+I'm going to stick to the minimum for now.
+
+UPDATE 8/15/18: Kat from the Voight/Brown labs suggested using the
+supplied scripts to normalize the splicing data. Prior to this, I'm going to filter
+
+#+BEGIN_SRC 
+
+module load R-3.2.2
+
+R
+
+source("general_fncs.R")
+
+library(dplyr)
+library(tidyr)
+library(peer)
+
+leafdir = "/project/tishkofflab/rna_redo/afr_wbrna/data/leafcutter"
+fastdir = "/project/tishkofflab/rna_redo/afr_wbrna/data/fastqtl"
+miscdir = "/project/tishkofflab/rna_redo/afr_wbrna/data/misc"
+
+# get the samples that have genetic data
+samps_in_5M = readLines(file.path(miscdir,"samps.txt"))
+samps_in_5M_col = samps_in_5M %>% paste("Sample", ., sep="_") %>% paste(., "leafcutter", sep=".")
+
+## I first need to read in the read count and intron ratio files
+leaf.cnt = read.delim(file.path(leafdir,"leafcutter_all_perind_numers.counts.gz"), sep="", row.names=1, stringsAsFactors=F) %>% 
+select(samps_in_5M_col)
+leaf.rat = read.delim(file.path(leafdir,"leafcutter_all_perind.counts.gz"), sep="", row.names=1, stringsAsFactors=F) %>% 
+select(c(samps_in_5M_col))
+
+## get sample names
+samps.cnt = grep("Sample", colnames(leaf.cnt), value=T)
+samps.rat = grep("Sample", colnames(leaf.rat), value=T)
+
+## get ids
+samps.cnt.ids  = data.frame(cols=samps.cnt) %>% 
+separate(cols, into=c("foo","cols"), sep="_") %>% 
+separate(cols, into=c("Sample","bar"), sep="\\.") %>% 
+.$Sample
+
+samps.rat.ids  = data.frame(cols=samps.rat) %>% 
+separate(cols, into=c("foo","cols"), sep="_") %>% 
+separate(cols, into=c("Sample","bar"), sep="\\.") %>% 
+.$Sample
+
+
+## rename the columns
+colnames(leaf.cnt) = samps.cnt.ids
+colnames(leaf.rat) = samps.rat.ids
+
+
+## first I'm going to filter the ratio file based on read counts.
+intron_info = data.frame(intron=row.names(leaf.cnt)) %>%
+    separate(col=intron, into=c("chr","start","end","cluster"), sep=":", remove=F)
+
+leaf.cnt$intron = row.names(leaf.cnt)
+leaf.cnt$cluster = intron_info$cluster
+leaf.rat$cluster = intron_info$cluster
+
+intron_keep = apply(leaf.cnt %>% select(-c(intron,cluster)), 1, function(x) sum(x==0)) <= 5
+
+## keep clusters with at least 20 reads in 100 individuals and nonzero in at least 10 individuals
+cluster_keep = leaf.cnt %>%
+    gather(key="sample", value="reads", -c(intron,cluster)) %>%
+    group_by(cluster, sample) %>%
+    summarise(sum_reads = sum(reads)) %>%
+    group_by(cluster) %>%
+    summarise(num_thresh = sum(sum_reads >= 20), num_zero = sum(sum_reads==0)) %>%
+    filter(num_thresh >= 4 & num_zero <= 5) %>%
+    .$cluster
+    
+
+leaf.cnt.clean = leaf.cnt[intron_keep & leaf.cnt$cluster %in% cluster_keep,]
+leaf.rat.clean = leaf.rat[intron_keep & leaf.rat$cluster %in% cluster_keep,]
+leaf.rat.clean$chrom = row.names(leaf.rat.clean)
+
+
+## write out filtered fractions
+write.table(leaf.rat.clean[, c("chrom", samps.rat.ids)], 
+file.path(leafdir, "leafcutter_all_perind.filt.counts") , sep=" ", quote=F, row.names=F)
+
+#+END_SRC
+
+** process and normalize leafcutter counts file
+
+I'm using the leafcutter scripts to process the filtered counts file
+
+NEW
+#+BEGIN_SRC 
+
+# extract clusters that start with 0-9
+zcat $LEAFDIR/leafcutter_all_perind.counts.gz | \
+egrep "^[c0-9]" | \
+bgzip > $LEAFDIR/leafcutter_all_perind.chr.counts.gz
+
+# create table
+source $HOME/my_python-2.7.9/bin/activate
+
+python ~/bin/leafcutter/scripts/prepare_phenotype_table.py $LEAFDIR/leafcutter_all_perind.chr.counts.gz -p 10
+
+#+END_SRC
+
+OLD
+#+BEGIN_SRC 
+
+zcat ../leafcutter_all_perind.filt.counts.gz | head -n 1 > ../leafcutter_all_perind.filt.chrs.counts
+zcat ../leafcutter_all_perind.filt.counts.gz | egrep "^[0-9]" >> ../leafcutter_all_perind.filt.chrs.counts
+bgzip -f ../leafcutter_all_perind.filt.chrs.counts
+
+source $HOME/my_python-2.7.9/bin/activate
+
+python ~/bin/leafcutter/scripts/prepare_phenotype_table.py ../leafcutter_all_perind.filt.chrs.counts.gz -p 10
+
+#+END_SRC
+
+** generate PEER factors for filtered, normalized data
+
+First I need to combine the qqnorm files from leafcutter into a single
+file to calculate PEER factors.
+
+#+BEGIN_SRC 
+
+## unfiltered data
+head -n 1 leafcutter_all_perind.chr.counts.gz.qqnorm_chr1 | sed 's/Sample_//g' | sed 's/\.leafcutter//g' > leafcutter_all_perind.chr.counts.qqnorm_all
+cat *qqnorm_chr* | egrep -v "^#" >> leafcutter_all_perind.chr.counts.qqnorm_all
+bgzip -f leafcutter_all_perind.chr.counts.qqnorm_all
+
+
+## filtered data
+head -n 1 leafcutter_all_perind.filt.chrs.counts.gz.qqnorm_chr1 | sed 's/Sample_//g' | sed 's/\.leafcutter//g' > leafcutter_all_perind.filt.chr.counts.qqnorm_all
+cat *qqnorm_chr* | egrep -v "^#" >> leafcutter_all_perind.filt.chr.counts.qqnorm_all
+bgzip -f leafcutter_all_perind.filt.chr.counts.qqnorm_all
+
+#+END_SRC
+
+Next, I need to extract those columns with genotype data
+
+#+BEGIN_SRC
+
+module load R-3.2.2
+
+R
+
+library(dplyr)
+
+samps = readLines("../data/misc/samps.txt")
+
+qqnorm_geno = read.delim("../data/leafcutter/pheno/filt/leafcutter_all_perind.filt.chr.counts.qqnorm_all.gz") %>%
+select(c("X.Chr","start","end","ID",samps))
+
+write.table(qqnorm_geno, "../data/leafcutter/pheno/filt/leafcutter_all_perind.filt.chr.counts.qqnorm_all.geno", sep="\t", quote=F, row.names=F)
+
+q()
+
+bgzip -f ../data/leafcutter/pheno/filt/leafcutter_all_perind.filt.chr.counts.qqnorm_all.geno
+#+END_SRC
+
+Next I need to calculate PEER factors
+
+#+BEGIN_SRC 
+
+module load R-3.2.2
+
+R
+
+source("general_fncs.R")
+
+library(dplyr)
+library(tidyr)
+library(peer)
+
+leafdir = "/project/tishkofflab/rna_redo/afr_wbrna/data/leafcutter"
+fastdir = "/project/tishkofflab/rna_redo/afr_wbrna/data/fastqtl"
+miscdir = "/project/tishkofflab/rna_redo/afr_wbrna/data/misc"
+
+
+## read in normalized data
+qqnorm = read.delim(file.path(leafdir, "pheno/filt", "leafcutter_all_perind.filt.chr.counts.qqnorm_all.geno.gz"), stringsAsFactors=F)
+
+
+## read in other covariates, previously used by fastQTL
+covars = read.delim(file.path(fastdir, "Sample_ALL.fastqtl.covars.txt"), stringsAsFactors=F, row.names=1)
+
+## transpose covars
+covars.t = covars %>%
+   t %>%
+   as.data.frame
+
+## write out covariates with 0 peer factors
+write.table(t(covars.t), file=file.path(leafdir, paste(c("Sample_ALL.leafcutter.filt.covars.peer0.txt"), collapse="")), quote=F, row.names=F, sep="\t")
+
+
+## get peer factors, 5, 10, 15, 20, 25, and 30.
+set.seed(4690)
+
+n.factors.vec = c(1:20)
+
+for (n.factors in n.factors.vec){
+
+qqnorm.peer = run_peer(t(qqnorm %>% select(-c("X.Chr","start","end","ID"))), num_factors=n.factors)
+colnames(qqnorm.peer) = paste("peer", 1:n.factors, sep="")
+row.names(qqnorm.peer) = qqnorm %>% select(-c("X.Chr","start","end","ID")) %>% colnames
+
+
+## remove previous peer factors, add new peer factors, and write to covariate file.
+covars.t = covars.t %>%
+   select(-starts_with("peer"))
+
+
+# ## format leafcutter fractions as a bed file
+# leaf.frac.clean.bed = leaf.frac.clean %>% 
+# as.data.frame %>% 
+# rownames_to_column(., var="ID") %>% 
+# separate(ID, into=c("#Chr","start","end","cluster"), sep=":", remove=F) %>%
+# select(c("#Chr","start","end","ID",row.names(covars.t)))
+
+
+## add new peer factors, making sure that the columns match
+covars.t[,paste("peer", 1:n.factors, sep="")] = qqnorm.peer[row.names(covars.t),]
+write.table(t(covars.t), file=file.path(leafdir, paste(c("Sample_ALL.leafcutter.filt.covars.peer",n.factors,".txt"), collapse="")), quote=F, row.names=F, sep="\t")
+}
+
+#+END_SRC
+
+Finally, regress out the covariates from the phenotype file
+
+#+BEGIN_SRC 
+
+module load R-3.2.2
+
+R
+
+library(dplyr)
+
+## read in args
+args = commandArgs(trailingOnly=TRUE)
+
+pheno_file = "/project/tishkofflab/rna_redo/afr_wbrna/data/leafcutter/pheno/filt/leafcutter_all_perind.filt.chr.counts.qqnorm_all.geno.gz"
+covar_dir = "/project/tishkofflab/rna_redo/afr_wbrna/data/leafcutter/covars"
+covar_pattern = "Sample_ALL.leafcutter.filt.covars.peer*"
+out_dir = "/project/tishkofflab/rna_redo/afr_wbrna/data/leafcutter/pheno_resid"
+t_pref = "leafcutter_qqnorm_all_filt_resid"
+
+pheno = read.delim(pheno_file, stringsAsFactors=F)
+samps = pheno %>% select(-c(X.Chr,start,end,ID)) %>% colnames
+Y.mat = (pheno %>% select(samps) %>% t)
+
+## list files
+covar_files = list.files(path=covar_dir,
+                         pattern=covar_pattern)
+
+for (covar_file in covar_files){
+
+    ## read in covariates for given number of peer factors
+    covars = read.delim(file.path(covar_dir, covar_file), stringsAsFactors=F) %>% t
+
+    ## get residuals by normal multiple regression
+    residuals = Y.mat - covars %*% solve(t(covars) %*% covars) %*% t(covars) %*% Y.mat
+
+    ## write results
+    out.f = file.path(out_dir, paste(out_pref, covar_file, sep="_"))
+    write.table(cbind(pheno %>% select(c(X.Chr,start,end,ID)), t(residuals)),
+                file = out.f,
+                sep = "\t",
+                quote = F,
+                row.names = F)
+}
+
+#+END_SRC
+
+Compress files
+
+#+BEGIN_SRC 
+
+RESIDIR=$LEAFDIR/pheno_resid
+
+RESIDFS=($( ls $RESIDIR ))
+
+for RESIDF in ${RESIDFS[@]};
+do
+
+bgzip $RESIDIR/$RESIDF &
+
+done
+
+#+END_SRC
+
+** convert VCF to BIMBAM file
+
+Generate mean genotype BIMBAM file for use with GEMMA
+
+#+BEGIN_SRC 
+
+VCF=$GENDIR/5M.imputed.dose.biallelic.vcf.gz
+DOSES=$GENDIR/5M.imputed.dose.biallelic.doses.txt
+
+bsub -o ${LOGDIR}/vcf2bimbam.log \
+-e ${ERRDIR}/vcf2bimbam.err \
+perl vcf2bimbam.pl $VCF $DOSES
+
+bgzip -f $DOSES
+tabix -s 1 -b 2 -e 2 $DOSES.gz
+
+#+END_SRC
+
+Generate GRM using GEMMA
+
+#+BEGIN_SRC 
+
+BIMBAM=$GENDIR/5M.imputed.dose.biallelic.bimbam.txt.gz
+PHENO=$LEAFDIR/foo.pheno.txt
+GRM=$GENDIR/5M.imputed.dose.biallelic.grm
+
+zcat $DOSES.gz | cut -f1,2 --complement | bgzip > $BIMBAM &
+
+zcat $LEAFDIR/Sample_ALL.leafcutter.frac.bed.gz | head -n 2 | tail -n 1 | cut -f1-4 --complement | sed 's/\t/\n/g' > $PHENO
+
+bsub \ #-M 10240 \
+-o $LOGDIR/make_grm.log \
+-e $ERRDIR/make_grm.err \
+bash make_grm.sh \
+$BIMBAM \
+$PHENO \
+$GRM
+
+#+END_SRC
+
+** run FastQTL
+
+Run permutation pass
+
+#+BEGIN_SRC 
+
+COVAR=${LEAFDIR}/Sample_ALL.leafcutter.covars.txt
+VCF=${GENDIR}/5M.imputed.dose.biallelic.maf05.vcf.gz
+OUTDIR=${LEAFDIR}/permute_out
+
+mkdir -p $OUTDIR
+
+for i in {1..21};
+do
+
+BED=${LEAFDIR}/pheno/leafcutter_all_perind.filt.chrs.counts.gz.qqnorm_chr${i}.gz
+OUT=${OUTDIR}/Sample_ALL.leafqtl.permute.chr${i}.txt
+
+bsub -o ${LOGDIR}/fastqtl.chr${i}.log \
+-e ${ERRDIR}/fastqtl.chr${i}.err \
+bash fastqtl.sh \
+$VCF \
+$BED \
+$COVAR \
+$i \
+$OUT
+
+done
+
+#+END_SRC
+
+** merge GEMMA results with gene names
+
+First I need to extract the position information from the results and
+then run through get_cluster_gene.py:
+
+#+BEGIN_SRC 
+
+python ~/bin/leafcutter/clustering/get_cluster_gene.py \
+$GENODIR/gencode/gencode.v19.transcripts.patched_contigs.gtf.gz 
+$LEAFDIR/leafcutter_all_perind.filt.chrs.counts.gz
+
+#+END_SRC
+
+Use my script to merge GEMMA results with gene IDs:
+
+#+BEGIN_SRC 
+
+NPEER={1..20}
+
+for i in ${NPEER[@]};
+do
+
+bsub perl merge_gemma_gene.pl \
+$LEAFDIR/results/leafcutter_qqnorm_all_resid_Sample_ALL.peer$i.results.txt.gz \
+$LEAFDIR/leafcutter_all.clu2gene.txt \
+$LEAFDIR/results/leafcutter_qqnorm_all_resid_Sample_ALL.peer$i.results.wgenes.txt
+
+done
+
+for i in {1..20};
+do
+
+bsub bgzip $LEAFDIR/results/leafcutter_qqnorm_all_resid_Sample_ALL.peer$i.results.wgenes.txt
+
+done
+
+#+END_SRC
+
+I now need to get significant GEMMA sQTL results:
+
+#+BEGIN_SRC 
+
+OUTDIR=$LEAFDIR/fdr05
+FDR=0.05
+
+mkdir -p $OUTDIR
+
+for i in {1..20};
+do
+
+SQTL=$LEAFDIR/results/leafcutter_qqnorm_all_resid_Sample_ALL.peer$i.results.wgenes.txt.gz
+OUT=$OUTDIR/leafcutter_qqnorm_all_resid_Sample_ALL.peer$i.results.wgenes.fdr05.txt.gz
+
+bsub -M 20480 \
+-o $LOGDIR/get_sig_sqtl.log \
+-e $ERRDIR/get_sig_sqtl.err \
+bash get_sig_sqtl.sh $SQTL $FDR $OUT
+
+done
+
+#+END_SRC
+
+
+* eQTL analysis
+
+** get significant variants for each population independently.
+
+For each population, extract the significant eQTLs (both the top eQTL
+and all passing a given FDR threshold).
+
+#+BEGIN_SRC 
+
+for POP in ${POPS[@]};
+do
+
+RASQFILE=${RASQDIR}/${POP}/${POP}.rasqual.out.txt.gz
+OUTFILE=${RASQDIR}/${POP}/${POP}.rasqual.out.fdr05.txt.gz
+
+bsub -M 10240 \
+-o ${LOGDIR}/${POP}.get_sig_rasqual.log \
+-e ${ERRDIR}/${POP}.get_sig_rasqual.err \
+bash get_sig_rasqual.sh \
+$RASQFILE \
+0.05 \
+$OUTFILE
+
+done
+
+#+END_SRC
+
+I need to repeat this for the filtered data
+
+#+BEGIN_SRC 
+
+for POP in ${POPS[@]};
+do
+
+RASQFILE=${RASQDIR}/${POP}/${POP}.rasqual.out.filt.txt.gz
+OUTFILE=${RASQDIR}/${POP}/${POP}.rasqual.out.filt.fdr05.txt.gz
+
+bsub -M 10240 \
+-o ${LOGDIR}/${POP}.get_sig_rasqual.filt.log \
+-e ${ERRDIR}/${POP}.get_sig_rasqual.filt.err \
+bash get_sig_rasqual.sh \
+$RASQFILE \
+0.05 \
+$OUTFILE
+
+done
+
+#+END_SRC
+
+** extract information from original populations for all significant eQTL
+
+I have the genome-wide significant eQTL after meta-analysis, what I
+want now are the raw statistics from each of the populations so that I
+can look at things like frequency in each population, effect size and
+average effect size, etc.
+
+#+BEGIN_SRC sh
+SIGGENES=($( tail -n +2 ${EQTLDIR}/all_pops.rasqual.metal.fdr05.minp.uniq.txt| cut -f3 ))
+SIGSNPS=($( tail -n +2 ${EQTLDIR}/all_pops.rasqual.metal.fdr05.minp.uniq.txt| awk '{ print $1 ":" $2 }' ))
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+NGENES=${#SIGGENES[@]}
+
+for POP in ${POPS[@]};
+do
+
+  OUT=${EQTLDIR}/${POP}.rasqual.metal.fdr05.minp.uniq.txt
+  OUTDIR=${RASQDIR}/${POP}/rasqual_out/100kb
+  
+  for i in $(seq 1 $NGENES);
+  do
+  
+    grep ${SIGSNPS[$i-1]} ${OUTDIR}/${SIGGENES[$i-1]}.rasqual.out >> $OUT
+  done
+done
+#+END_SRC
+** look for enrichment in Westra 2013
+
+*** convert Westra hg18 coordinates to hg19 coordinates
+
+#+BEGIN_SRC sh
+# format positions as bed
+tail -n +2 2012-12-21-CisAssociationsProbeLevelFDR0.5.txt | awk '{ print "chr" $3 "\t" $4-1 "\t" $4 }' > westra_hg18_posits.bed
+
+# use liftover tool~
+~/bin/liftOver westra_hg18_posits.bed hg18ToHg19.over.chain.gz westra_hg19_posits.bed westra_hg19_unmapped.bed
+
+# get which don't successfully map
+grep chr westra_hg19_unmapped.bed > westra_hg19_unmapped.clean.bed
+
+# remove 'chr' because it's going to be a pain in the ass later
+sed -i 's/chr//g' westra_hg18_posits.bed
+sed -i 's/chr//g' westra_hg19_posits.bed
+sed -i 's/chr//g' westra_hg19_unmapped.clean.bed
+
+#+END_SRC
+
+
+* Read Origin Protocol
+
+** install ROP
+
+#+BEGIN_SRC 
+
+DBDIR=$DATADIR/rop
+
+mkdir -p $DBDIR
+
+cd ~/bin
+
+git clone https://github.com/smangul1/rop.git
+
+cd rop
+
+./install.sh -d ${DATADIR}/rop
+
+#+END_SRC
+** extract unmapped reads
+
+First step is to extract the unmapped reads from each individual,
+converting to fastq:
+
+#+BEGIN_SRC 
+
+for SAMPLE in ${SAMPLES[@]};
+do
+
+IN=${SAMPDIR}/${SAMPLE}/secondpassAligned.out.bam
+OUT=${SAMPDIR}/${SAMPLE}/secondpassAligned.unmapped.out.fastq
+
+bsub -o ${LOGDIR}/extract_unmapped_reads.${SAMPLE}.log \
+-e ${ERRDIR}/extract_unmapped_reads.${SAMPLE}.err \
+bash extract_unmapped_reads.sh $IN $OUT
+
+done
+
+#+END_SRC
+
+Run ROP
+
+#+BEGIN_SRC 
+
+IN=${SAMPDIR}/${SAMPLES[1]}/secondpassAligned.unmapped.out.bam
+OUTDIR=${SAMPDIR}/${SAMPLES[1]}/rop
+
+bsub -q legacy -M 10240 \
+-o ${LOGDIR}/${SAMPLES[1]}_rop.log \
+-e ${ERRDIR}/${SAMPLES[1]}_rop.err \
+bash run_rop.sh $IN $OUTDIR
+
+for i in {2..171};
+do
+
+IN=${SAMPDIR}/${SAMPLES[$i]}/secondpassAligned.unmapped.out.bam
+OUTDIR=${SAMPDIR}/${SAMPLES[$i]}/rop
+
+bsub -q legacy -M 10240 \
+-o ${LOGDIR}/${SAMPLES[$i]}_rop.log \
+-e ${ERRDIR}/${SAMPLES[$i]}_rop.err \
+bash run_rop.sh $IN $OUTDIR
+
+
+done
+
+#+END_SRC    
+
+
+* Functional enrichment
+
+** Roadmap Epigenomics
+
+Intersect variants with DHS from blood celltypes and all celltypes
+
+#+BEGIN_SRC 
+
+
+
+#+END_SRC
+
+** GOShifter
+
+*** calculate LD between top variants and other variants with 100kb
+*** get unique variants
+
+#+BEGIN_SRC 
+plink --file ${GENDIR}/5M.imputed.dose.noambig \
+--exclude ${GENDIR}/reference.dups \
+--make-bed --out ${GENDIR}/5M.imputed.dose.noambig.uniq
+#+END_SRC
+
+*** calculate LD between tag eqtl variants
+#+BEGIN_SRC 
+#get SNP ids
+tail -n +2 ${EQTLDIR}/all_pops.rasqual.metal.fdr05.minp.txt | \
+awk '{ print $1 ":" $2 }' | sort | uniq > ${EQTLDIR}/goshifter/snp_ids.txt
+
+# calculate LD
+GTYPES=${GENDIR}/5M.imputed.dose.noambig.uniq
+LDOUT=${EQTLDIR}/goshifter/eqtl.fdr05.ld
+
+plink --bfile $GTYPES --r2 dprime \
+--ld-window-kb 100 \
+--ld-window 99999 \
+--ld-snp-list ${EQTLDIR}/goshifter/snp_ids.txt \
+--out $LDOUT
+#+END_SRC
+
+*** run GOShifter
+
+#+BEGIN_SRC sh
+SNPMAP=${EQTLDIR}/goshifter/eqtl_fdr05_snpmap.txt
+LDFILE=${EQTLDIR}/goshifter/eqtl_fdr05_ld.txt
+
+# make SNP map file
+echo -e "SNP\tChrom\tBP" > ${EQTLDIR}/goshifter/eqtl_fdr05_snpmap.txt
+awk -F':' '{ print $1 ":" $2 "\tchr" $1 "\t" $2 }' ${EQTLDIR}/goshifter/snp_ids.txt >> $SNPMAP
+
+# make LD file
+echo -e "ChromA\tPosA\tRsIdA\tChromB\tPosB\tRsIdB\tDistance\tRSquared\tDprime" > ${EQTLDIR}/goshifter/eqtl_fdr05_ld.txt
+tail -n +2 ${EQTLDIR}/goshifter/eqtl.fdr05.ld.ld | awk '{ print "chr" $1 "\t" $2 "\t" $3 "\tchr" $4 "\t" $5 "\t" $6 "\t" $5 - $2 "\t" $7 "\t" $8 }' >> $LDFILE
+tail -n +2 $SNPMAP | awk '{ print $2 "\t" $3 "\t" $1 "\t" $2 "\t" $3 "\t" $1 "\t0\t1\t1" }' >> $LDFILE
+
+# get DNase files
+readarray -t DNASES<${MISCDIR}/epi_roadmap/dnase/dnase_files.txt
+
+for DNASE in ${DNASES[@]};
+do
+
+CTYPE=$(echo $DNASE | cut -d"-" -f1)
+GSHIFTOUT=${EQTLDIR}/goshifter/output/eqtl_fdr05_goshifter_dnase${CTYPE}.txt
+
+# run goshifter
+bsub -o ${LOGDIR}/eqtl_fdr05_goshifter_dnase_${CTYPE}.log \
+-e ${ERRDIR}/eqtl_fdr05_goshifter_dnase_${CTYPE}.err \
+~/bin/goshifter/goshifter.py --snpmap $SNPMAP \
+--annotation ${MISCDIR}/epi_roadmap/dnase/${DNASE} \
+--proxies $LDFILE \
+--permute 10000 \
+--out $GSHIFTOUT
+
+done
+#+END_SRC
+
+I want to combine all of the p-values into one file:
+
+paste <( ls ${LOGDIR}/eqtl_fdr05_goshifter_dnase_E*.log ) <( tail -n 20 ${LOGDIR}/eqtl_fdr05_goshifter_dnase_E*.log | grep "p-value" ) > eqtl_fdr05_goshifter_dnase_EALL.pvals.txt 
+
+*** run stratified GOShifter
+
+I want to see if there's an enrichment in non-blood cell-types,
+stratifying by enhancers in blood cell types.
+
+#+BEGIN_SRC sh
+SNPMAP=${EQTLDIR}/goshifter/eqtl_fdr05_snpmap.txt
+LDFILE=${EQTLDIR}/goshifter/eqtl_fdr05_ld.txt
+BLDDNASE=${MISCDIR}/epi_roadmap/dnase/BLD-DNase.macs2.merge.narrowPeak.gz
+
+readarray -t NBLDDNASES<${MISCDIR}/epi_roadmap/dnase/nonblood_ctypes.txt
+
+for DNASE in ${NBLDDNASES[@]};
+do
+
+CTYPE=$(echo $DNASE | cut -d"-" -f1)
+GSHIFTOUT=${EQTLDIR}/goshifter/output/eqtl_fdr05_goshifter_stratbld_dnase${CTYPE}.txt
+
+# run goshifter
+bsub -o ${LOGDIR}/eqtl_fdr05_goshifter_stratbld_dnase_${CTYPE}.log \
+-e ${ERRDIR}/eqtl_fdr05_goshifter_stratbld_dnase_${CTYPE}.err \
+~/bin/goshifter/goshifter.strat.py --snpmap $SNPMAP \
+--annotation-a ${MISCDIR}/epi_roadmap/dnase/${DNASE} \
+--annotation-b $BLDDNASE \
+--proxies $LDFILE \
+--permute 10000 \
+--out $GSHIFTOUT
+
+done
+#+END_SRC
+
+I want p-values for the stratified conditional analysis as well
+
+paste <( ls ${LOGDIR}/eqtl_fdr05_goshifter_stratbld_dnase_E*.log ) <( tail -n 20 ${LOGDIR}/eqtl_fdr05_goshifter_stratbld_dnase_E*.log | grep "p-value" ) > eqtl_fdr05_goshifter_stratbld_dnase_EALL.pvals.txt 
+
+** Transcription Factors
+
+I'm interested in whether TF binding sites are enriched among
+sequences surrounding eQTLs, whether there are examples of TF
+disruption in the direction that's expected. HOMER to test regions,
+FIMO for known TFs?* D statistic
+
+** Calculate FST between all pairs of population
+
+I need to calculate all pairwise FST to calculate the D statistic for
+each population. I should have a script to do this.
+
+#+BEGIN_SRC sh
+FSTDIR=${DATADIR}/fst
+VCF=${GENDIR}/5M.imputed.dose.biallelic.vcf.gz
+
+# read in the list of chromosomes and populations                                                                                                                                 
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+mkdir -p $FSTDIR
+
+NUMPOP=${#POPS[@]}
+
+# Calculate Fst values for each pairwise population.                                                                                                                              
+for i in $(seq 0 $(($NUMPOP-2)));
+do
+    for j in $(seq $(($i+1)) $(($NUMPOP-1)));
+    do
+        # define files                                                                                                                                                            
+        POP1=${POPS[$i]}
+        POP2=${POPS[$j]}
+        POP1FILE=${MISCDIR}/pops/in5M/${POP1}.txt
+        POP2FILE=${MISCDIR}/pops/in5M/${POP2}.txt
+        OUT=${FSTDIR}/${POP1}_${POP2}
+
+	# calculate F_ST                                                                                                                                                          
+	bsub -o ${LOGDIR}/fst_all.log \
+             -e ${ERRDIR}/fst_all.err \
+             vcftools \
+	       --gzvcf ${VCF} \
+	       --weir-fst-pop ${POP1FILE} \
+	       --weir-fst-pop ${POP2FILE} \
+	       --out ${OUT}
+    done
+done
+#+END_SRC
+
+Calculate the Z-scores for Fst values.
+
+#+BEGIN_SRC sh
+FSTDIR=${DATADIR}/fst
+DSTATDIR=${FSTDIR}/Dstat
+
+# read in the list of chromosomes and populations                                                                                                                                 
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+FSTFILES=($( ls ${FSTDIR}/*weir.fst ))
+
+for FILE in ${FSTFILES[@]};
+do
+
+FILENAME=${FILE##*/}
+
+OUTFILE=${DSTATDIR}/${FILENAME}.zscore
+
+bsub Rscript calc_zscore.R $FILENAME $OUTFILE
+
+done
+#+END_SRC
+
+Calculate D statistic from the Z-scores
+
+#+BEGIN_SRC sh
+FSTDIR=${DATADIR}/fst
+DSTATDIR=${FSTDIR}/Dstat
+
+readarray -t POPS<${MISCDIR}/all_pops.txt
+
+for POP in ${POPS[@]};
+do
+
+bsub bash ${PIPEDIR}/calc_d.sh $POP $DSTATDIR $DSTATDIR
+         
+done
+#+END_SRC
+
+Finally, remove all of the zscore files
+
+#+BEGIN_SRC sh
+rm ${DSTATDIR}/*zscore
+#+END_SRC
+
+
+* ADMIXTURE
+
+I'm going to use the same files to run ADMIXTURE as I used for PCA, including the --cv flag for cross-validation
+
+#+BEGIN_SRC 
+
+# ## make PED file a BED file
+# PEDFILE=${GENDIR}/5M.imputed.dose.noambig.ldprune.hwe.extract
+# plink --file $PEDFILE --make-bed --out $PEDFILE
+
+BEDFILE=${GENDIR}/5M.imputed.dose.noambig.ldprune.hwe.extract.bed
+
+for K in {3..9};
+do
+
+bsub -o $LOGDIR/admixture_$K.log \
+-e $ERRDIR/admixture_$K.err \
+bash $PIPEDIR/run_admixture.sh $BEDFILE $K
+
+done
+
+#+END_SRC
+
+
+* iHS
+
+The Sardinian eQTL used selscan for calculating iHS so I think I'll do
+the same.
+
+#+BEGIN_SRC 
+
+IHSDIR=$DATADIR/ihs
+
+for i in {1..21};
+do
+
+VCF=$IHSDIR/5M.imputed.dose.biallelic.05.chr$i.vcf.gz
+MAP=$IHSDIR/5M.imputed.dose.biallelic.05.chr$i.map
+OUT=$IHSDIR/5M.imputed.dose.biallelic.05.chr$i
+
+bsub -o $LOGDIR/ihs_call.log \
+-e $ERRDIR/ihs_call.err \
+bash ihs_call.sh $VCF $MAP $OUT
+
+done
+
+#+END_SRC
+
+I'm going to repeat with the interpolated genetic map
+
+#+BEGIN_SRC 
+
+IHSDIR=$DATADIR/ihs
+
+for i in {1..21};
+do
+
+VCF=$IHSDIR/5M.imputed.dose.biallelic.05.chr$i.vcf.gz
+MAP=$IHSDIR/interp_map/5M.imputed.dose.biallelic.05.chr$i.map
+OUT=$IHSDIR/5M.imputed.dose.biallelic.05.chr$i.interp
+
+bsub -o $LOGDIR/ihs_call.log \
+-e $ERRDIR/ihs_call.err \
+bash ihs_call.sh $VCF $MAP $OUT
+
+done
+
+#+END_SRC
+
+Normalize the iHS scores
+
+#+BEGIN_SRC 
+
+IHSDIR=$DATADIR/ihs
+
+OUTS=$(ls $IHSDIR/5M.imputed.dose.biallelic.05.chr*.ihs.out)
+
+bsub -o $LOGDIR/ihs_norm.log \
+-e $ERRDIR/ihs_norm.err \
+~/bin/selscan/norm --ihs --files $OUTS
+
+
+## also do th no MHC chr6:27000000-33000000
+
+mv $IHSDIR/5M.imputed.dose.biallelic.05.chr6.ihs.out $IHSDIR/5M.imputed.dose.biallelic.05.tmp_chr6.ihs.out
+
+OUTS=$(ls $IHSDIR/5M.imputed.dose.biallelic.05.chr*.ihs.out)
+
+bsub -o $LOGDIR/ihs_norm.log \
+-e $ERRDIR/ihs_norm.err \
+~/bin/selscan/norm --ihs --files $OUTS
+
+#+END_SRC
+
+Normalize iHS scores for interpolated data
+
+#+BEGIN_SRC 
+
+IHSDIR=$DATADIR/ihs
+
+OUTS=$(ls $IHSDIR/5M.imputed.dose.biallelic.05.chr*.interp.ihs.out)
+
+bsub -o $LOGDIR/ihs_norm.log \
+-e $ERRDIR/ihs_norm.err \
+~/bin/selscan/norm --ihs --files $OUTS
+
+
+## also do with no MHC chr6:27000000-33000000
+
+mv $IHSDIR/5M.imputed.dose.biallelic.05.chr6.interp.ihs.out $IHSDIR/5M.imputed.dose.biallelic.05.tmp_chr6.interp.ihs.out
+
+OUTS=$(ls $IHSDIR/5M.imputed.dose.biallelic.05.chr*.ihs.out)
+
+bsub -o $LOGDIR/ihs_norm.log \
+-e $ERRDIR/ihs_norm.err \
+~/bin/selscan/norm --ihs --files $OUTS
+
+#+END_SRC
+
+
+* misc
+
+** get frequenncy information per populationn
+
+ #+BEGIN_SRC 
+
+FRQDIR=$FSTDIR/frq
+
+mkdir -p $FRQDIR
+
+VCF=$GENDIR/5M.imputed.dose.biallelic.vcf.gz
+
+for POP in ${POPS[@]};
+do
+
+SAMPS=$MISCDIR/pops/in5M/$POP.txt
+OUT=$FRQDIR/$POP.5M.imputed.dose.biallelic
+
+bsub bash get_frq_pop.sh $VCF $SAMPS $OUT
+
+done
+ 
+#+END_SRC
+
+** Getting frequency and distance info for QTLs
+I'm going to generate a file with frequency and distance to gene information:
+
+#+BEGIN_SRC 
+
+## get distance to nearest gene
+tail -n +2 $GENDIR/5M.imputed.dose.biallelic.frq | \
+awk '{ print "chr" $1 "\t" $2-1 "\t" $2 "\t" $6 }' | \
+sort -k1,1 -k2,2n | \
+bedtools closest -d -a stdin -b $GENODIR/gencode/gencode.v19.genes.v7.patched_contigs.gene_only.gtf.gz -wa -wb | \
+awk -F'\t' '{ print $1 "\t" $3 "\t" $4 "\t" $14 }' | \
+sed 's/^chr//g' | \
+sed 's/:/\t/g' | bgzip > $MISCDIR/5M.imputed.dose.biallelic.frq.dist_gene.txt.gz
+
+## get distance to nearest tss
+## first make bed file
+awk '{ print $2 "\t" $3-1 "\t" $3 "\t" $1 }' $MISCDIR/gencode.v19.TSS.txt | \
+sort -k1,1 -k2,2n > $MISCDIR/gencode.v19.TSS.bed
+
+tail -n +2 $GENDIR/5M.imputed.dose.biallelic.frq | \
+awk '{ print "chr" $1 "\t" $2-1 "\t" $2 "\t" $6 }' | \
+sort -k1,1 -k2,2n | \
+bedtools closest -d -a stdin -b $MISCDIR/gencode.v19.TSS.bed -wa -wb | \
+awk -F'\t' '{ print $1 "\t" $3 "\t" $4 "\t" $9 }' | \
+sed 's/^chr//g' | \
+sed 's/:/\t/g' | bgzip > $MISCDIR/5M.imputed.dose.biallelic.frq.dist_tss.txt.gz
+
+#+END_SRC
+
+I'm going to get the distance to nearest gene for my eQTL and sQTL results as well
+
+#+BEGIN_SRC 
+
+## make distance from gene file for eQTLs
+zcat $METADIR/METAANALYSIS1.fdr05.TBL.gz | tail -n +2 | awk '{ print "chr" $3 "\t" $4-1 "\t" $4 }' | sort -k1,1 -k2,2n | bedtools closest -d -t first -a stdin -b $GENODIR/gencode/gencode.v19.genes.v7.patched_contigs.gene_only.gtf.gz -wa -wb | awk -F'\t' '{ print $1 ":" $3 "\t" $13 }' | sed 's/^chr//g' | bgzip > eqtl_dist_nearest_gene.txt.gz
+
+## make distance from gene file for sQTLs
+zcat $LEAFDIR/fdr05/leafcutter_qqnorm_all_resid_Sample_ALL.peer1.results.wgenes.fdr05.txt.gz | tail -n +2 | cut -f2 | awk -F':' '{ print "chr" $1 "\t" $2-1 "\t" $2 }' | sort -k1,1 -k2,2n | bedtools closest -d -t first -a stdin -b $GENODIR/gencode/gencode.v19.genes.v7.patched_contigs.gene_only.gtf.gz -wa -wb | awk -F'\t' '{ print $1 ":" $3 "\t" $13 }' | sed 's/^chr//g' | bgzip > sqtl_dist_nearest_gene.txt.gz
+
+
+## make distance from TSS file for eQTLs
+zcat $METADIR/METAANALYSIS1.fdr05.TBL.gz | \
+tail -n +2 | \
+awk '{ print "chr" $3 "\t" $4-1 "\t" $4 }' | \
+sort -k1,1 -k2,2n | \
+bedtools closest -d -t first -a stdin -b $MISCDIR/gencode.v19.TSS.bed -wa -wb | \
+awk -F'\t' '{ print $1 ":" $3 "\t" $8 }' | \
+sed 's/^chr//g' | \
+bgzip > eqtl_dist_nearest_tss.txt.gz
+
+## make distance from TSS file for sQTLs
+zcat $LEAFDIR/fdr05/leafcutter_qqnorm_all_resid_Sample_ALL.peer1.results.wgenes.fdr05.txt.gz | \
+tail -n +2 | \
+cut -f2 | \
+awk -F':' '{ print "chr" $1 "\t" $2-1 "\t" $2 }' | \
+sort -k1,1 -k2,2n | \
+bedtools closest -d -t first -a stdin -b $MISCDIR/gencode.v19.TSS.bed -wa -wb | \
+awk -F'\t' '{ print $1 ":" $3 "\t" $8 }' | \
+sed 's/^chr//g' | \
+bgzip > sqtl_dist_nearest_tss.txt.gz
+
+#+END_SRC
+
+
+* treemix
+
+** prune data
+
+#+BEGIN_SRC 
+
+bsub bash prune.sh \
+-o prune.log \
+-e prune.err \
+5M.imputed.dose.biallelic \
+5M.imputed.dose.biallelic.ld_prune
+
+vcftools --vcf 5M.imputed.dose.biallelic.ld_prune.vcf \
+--snps 5M.imputed.dose.biallelic.ld_prune.prune.in \
+--recode --out 5M.imputed.dose.biallelic.ld_prune.in
+
+rm 5M.imputed.dose.biallelic.ld_prune.vcf
+
+#+END_SRC
+
+Extracting 5954708 out of a possible 22214072 SNPs
+
+#+BEGIN_SRC 
+
+vcftools --gzvcf 5M.imputed.dose.biallelic.ld_prune.vcf --snps 5M.imputed.dose.biallelic.ld_prune.prune.in --recode --recode-INFO-all --out 5M.imputed.dose.biallelic.ld_prune.in
+
+#+END_SRC
+
+
+** extract pruned SNPs from Neandertal genome
+
+#+BEGIN_SRC 
+
+# get bed file
+awk -F':' '{ print $1 "\t" $2-1 "\t" $2 }' 5M.imputed.dose.biallelic.ld_prune.prune.in > 5M.imputed.dose.biallelic.ld_prune.prune.in.bed
+
+# get header
+zcat neandertal/AltaiNea.hg19_1000g.1.mod.vcf.gz | head -n 1000 | grep "^#" \
+> AltaiNea.hg19_1000g.ld_prune.mod.vcf
+
+for i in {8..22};
+do
+
+bedtools intersect -a neandertal/AltaiNea.hg19_1000g.$i.mod.vcf.gz -b 5M.imputed.dose.biallelic.ld_prune.prune.in.bed >> AltaiNea.hg19_1000g.ld_prune.mod.vcf
+
+done
+
+#+END_SRC
+
+Next is to create genotype files for merging.
+
+#+BEGIN_SRC 
+
+vcf-concat neandertal_prune/AltaiNea.hg19_1000g.1.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.2.mod.ld_prune.in.recode.vcf \
+neandertal_prune/AltaiNea.hg19_1000g.3.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.4.mod.ld_prune.in.recode.vcf \
+neandertal_prune/AltaiNea.hg19_1000g.5.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.6.mod.ld_prune.in.recode.vcf \
+neandertal_prune/AltaiNea.hg19_1000g.7.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.8.mod.ld_prune.in.recode.vcf \
+neandertal_prune/AltaiNea.hg19_1000g.9.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.10.mod.ld_prune.in.recode.vcf \
+neandertal_prune/AltaiNea.hg19_1000g.11.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.12.mod.ld_prune.in.recode.vcf \
+neandertal_prune/AltaiNea.hg19_1000g.13.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.14.mod.ld_prune.in.recode.vcf \
+neandertal_prune/AltaiNea.hg19_1000g.15.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.16.mod.ld_prune.in.recode.vcf \
+neandertal_prune/AltaiNea.hg19_1000g.17.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.18.mod.ld_prune.in.recode.vcf \
+neandertal_prune/AltaiNea.hg19_1000g.19.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.20.mod.ld_prune.in.recode.vcf \
+neandertal_prune/AltaiNea.hg19_1000g.21.mod.ld_prune.in.recode.vcf neandertal_prune/AltaiNea.hg19_1000g.22.mod.ld_prune.in.recode.vcf | \
+bgzip > AltaiNea.hg19_1000g.mod.ld_prune.in.vcf.gz
+
+vcf-concat neandertal_isec/1/0000.vcf neandertal_isec/2/0000.vcf neandertal_isec/3/0000.vcf \
+neandertal_isec/4/0000.vcf neandertal_isec/5/0000.vcf neandertal_isec/6/0000.vcf \
+neandertal_isec/7/0000.vcf neandertal_isec/8/0000.vcf neandertal_isec/9/0000.vcf \
+neandertal_isec/10/0000.vcf neandertal_isec/11/0000.vcf neandertal_isec/12/0000.vcf \
+neandertal_isec/13/0000.vcf neandertal_isec/14/0000.vcf neandertal_isec/15/0000.vcf \
+neandertal_isec/16/0000.vcf neandertal_isec/17/0000.vcf neandertal_isec/18/0000.vcf \
+neandertal_isec/19/0000.vcf neandertal_isec/20/0000.vcf neandertal_isec/21/0000.vcf \
+neandertal_isec/22/0000.vcf | bgzip > 5M.isec.imputed.dose.biallelic.ld_prune.in.recode.vcf.gz
+
+vcf-merge 
+
+#+END_SRC
+
+Convert gtypes to counts
+
+#+BEGIN_SRC 
+
+perl get_counts.pl
+
+#+END_SRC
+
+Run treemix for 0 to 5 migrations
+
+#+BEGIN_SRC 
+
+COUNTS="5M.AltaiNea.imputed.dose.biallelic.ld_prune.counts.txt.gz"
+ROOT="Altai"
+
+for M in {0..5};
+do
+
+OUT="5M.AltaiNea.imputed.dose.biallelic.ld_prune.m$M"
+
+bsub -o .run_treemix.$M.log \
+-e .run_treemix.$M.err \
+bash run_treemix.wroot.sh $COUNTS $ROOT $M $OUT
+
+done
+
+#+END_SRC
+
+
+* IBD
+
+Run IBD on LD-pruned genotype data
+
+#+BEGIN_SRC 
+
+plink --file 5M.imputed.dose.noambig.ldprune.hwe.extract --genome
+
+#+END_SRC
