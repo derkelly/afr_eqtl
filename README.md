@@ -1,2 +1,2 @@
 # afr_eqtl
-Code for Kelly et al. 2022
+Code for Kelly et al. 2023
